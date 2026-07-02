@@ -1,0 +1,49 @@
+# Signal discovery on the trading bot's own broker data (H1 panels, 23 pairs).
+#
+# Data: set SIGNAL_DATA_DIR to .../src/signal_discovery_workflow/data/forex
+# before running (the evaluator reads panels from that env var — the old
+# `data_dir` YAML key was never a real config field and is intentionally
+# absent here). Regenerate panels with:  py export_discovery_panel.py
+#
+# Run:
+#   $env:SIGNAL_DATA_DIR = "<abs path>\src\signal_discovery_workflow\data\forex"
+#   .venv-nat\Scripts\nat run --config_file configs/config-bot-forex.yml --input "momentum and mean-reversion signals for forex"
+#
+# No telemetry section: does not require a Phoenix server.
+
+llms:
+  signal_generator:
+    _type: nim
+    model_name: nvidia/nemotron-3-nano-30b-a3b
+    base_url: "https://integrate.api.nvidia.com/v1/"
+    temperature: 0.8
+    max_tokens: 4000
+
+  code_generator:
+    _type: nim
+    model_name: nvidia/nemotron-3-nano-30b-a3b
+    base_url: "https://integrate.api.nvidia.com/v1/"
+    temperature: 0.0
+    max_tokens: 3000
+
+  optimization_advisor:
+    _type: nim
+    model_name: nvidia/nemotron-3-nano-30b-a3b
+    base_url: "https://integrate.api.nvidia.com/v1/"
+    temperature: 0.5
+    max_tokens: 2000
+
+workflow:
+  _type: signal_optimizer
+  signal_generator_llm: signal_generator
+  code_generator_llm: code_generator
+  optimization_advisor_llm: optimization_advisor
+  # Forex needs a lower IC bar than equities (from the project's own forex tuning)
+  ic_threshold: 0.015
+  p_value_threshold: 0.05
+  max_iterations: 5
+  num_signals: 3
+  # H1 panels: 4 bars = 4-hour forward horizon, matching the bot's typical
+  # triple-barrier resolution window (most TP/SL hits resolve within 4-12 bars).
+  forward_periods: 4
+  save_results: true

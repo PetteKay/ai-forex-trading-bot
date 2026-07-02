@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Forex Bot: Live Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <script>
+    tailwind.config = {
+      theme: { fontFamily: { sans: ["Syne", "sans-serif"], mono: ["IBM Plex Mono", "monospace"] } }
+    }
+  </script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    body { background: #0f172a; color: #e2e8f0; font-family: 'Syne', sans-serif; }
+    .mono { font-family: 'IBM Plex Mono', monospace; }
+    .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; }
+    .stat-val { font-size: 2rem; font-weight: 700; font-family: 'IBM Plex Mono', monospace; }
+    .win  { color: #4ade80; }
+    .loss { color: #f87171; }
+    .hold { color: #94a3b8; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 9999px; font-size: 0.7rem; font-weight: 600; }
+    .badge-buy  { background: #14532d; color: #4ade80; }
+    .badge-sell { background: #450a0a; color: #f87171; }
+    .badge-open { background: #1e3a5f; color: #60a5fa; }
+    .pulse { animation: pulse 2s infinite; }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+    table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+    th { padding: 8px 12px; text-align: left; color: #64748b; border-bottom: 1px solid #334155; }
+    td { padding: 7px 12px; border-bottom: 1px solid #1e293b; }
+    tr:hover td { background: #263244; }
+  </style>
+</head>
+<body class="min-h-screen p-4 md:p-6">
+
+  <!-- Header -->
+  <div class="flex items-center justify-between mb-6">
+    <div>
+      <h1 class="text-2xl font-bold text-white">AI Forex Bot</h1>
+      <p class="text-slate-400 text-sm mt-1">5-Agent Adversarial Desk · Real-time Dashboard</p>
+    </div>
+    <div class="flex items-center gap-3">
+      <span id="live-dot" class="pulse w-2 h-2 rounded-full bg-green-400"></span>
+      <span class="text-slate-400 text-xs" id="last-update">...</span>
+      <button onclick="refresh()" class="px-3 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded-lg">Refresh</button>
+    </div>
+  </div>
+
+  <!-- Stats row -->
+  <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3 mb-6">
+    <div class="card p-4">
+      <div class="text-slate-400 text-xs mb-1">Equity</div>
+      <div class="stat-val text-blue-400" id="stat-equity">...</div>
+    </div>
+    <div class="card p-4">
+      <div class="text-slate-400 text-xs mb-1">Total P&L</div>
+      <div class="stat-val" id="stat-pnl">...</div>
+    </div>
+    <div class="card p-4">
+      <div class="text-slate-400 text-xs mb-1">Trades</div>
+      <div class="stat-val text-white" id="stat-trades">...</div>
+    </div>
+    <div class="card p-4">
+      <div class="text-slate-400 text-xs mb-1">Win Rate</div>
+      <div class="stat-val text-yellow-400" id="stat-winrate">...</div>
+    </div>
+    <div class="card p-4">
+      <div class="text-slate-400 text-xs mb-1">Wins / Losses</div>
+      <div class="stat-val" id="stat-wl">...</div>
+    </div>
+    <div class="card p-4">
+      <div class="text-slate-400 text-xs mb-1">Best Trade</div>
+      <div class="stat-val win" id="stat-best">...</div>
+    </div>
+    <div class="card p-4">
+      <div class="text-slate-400 text-xs mb-1">Worst Trade</div>
+      <div class="stat-val loss" id="stat-worst">...</div>
+    </div>
+  </div>
+
+  <!-- Open positions + Equity chart -->
+  <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-6">
+    <!-- Open positions -->
+    <div class="card p-4">
+      <h2 class="text-sm font-semibold text-slate-300 mb-3">Open Positions</h2>
+      <div id="open-positions">
+        <p class="text-slate-500 text-sm">No open positions</p>
+      </div>
+    </div>
+    <!-- Equity curve -->
+    <div class="card p-4 lg:col-span-2">
+      <h2 class="text-sm font-semibold text-slate-300 mb-3">Equity Curve</h2>
+      <canvas id="equity-chart" height="120"></canvas>
+    </div>
+  </div>
+
+  <!-- Trade history -->
+  <div class="card p-4 mb-6">
+    <h2 class="text-sm font-semibold text-slate-300 mb-3">Recent Trades</h2>
+    <div class="overflow-x-auto">
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th><th>Symbol</th><th>Dir</th><th>Entry</th>
+            <th>Exit</th><th>P&L</th><th>P&L%</th><th>Outcome</th>
+            <th>Conf</th><th>Regime</th><th>Hold</th>
+          </tr>
+        </thead>
+        <tbody id="trades-body">
+          <tr><td colspan="11" class="text-slate-500 text-center py-4">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Recent ticks -->
+  <div class="card p-4">
+    <h2 class="text-sm font-semibold text-slate-300 mb-3">Decision Log (last 50 ticks)</h2>
+    <div class="overflow-x-auto">
+      <table>
+        <thead>
+          <tr><th>Time</th><th>Symbol</th><th>Regime</th><th>Bias</th><th>Action</th><th>Conf</th><th>Session</th></tr>
+        </thead>
+        <tbody id="ticks-body">
+          <tr><td colspan="7" class="text-slate-500 text-center py-4">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <p class="text-center text-slate-600 text-xs mt-6">Auto-refreshes every 30s · AI Forex Bot v2 · 5-Agent Adversarial Architecture</p>
+
+<script>
+let equityChart = null;
+
+function fmt(v, dec=2) { return v != null ? Number(v).toFixed(dec) : '...'; }
+function pnlClass(v) { return v > 0 ? 'win' : v < 0 ? 'loss' : 'hold'; }
+function shortTime(ts) {
+  if (!ts) return '...';
+  const d = new Date(ts.replace(' ', 'T') + (ts.includes('+') ? '' : 'Z'));
+  return d.toISOString().slice(5,16).replace('T',' ');
+}
+
+async function loadStats() {
+  try {
+    const r = await fetch('/api/stats');
+    const d = await r.json();
+    document.getElementById('stat-equity').textContent  = fmt(d.equity, 2);
+    const pnlEl = document.getElementById('stat-pnl');
+    pnlEl.textContent = (d.total_pnl >= 0 ? '+' : '') + fmt(d.total_pnl, 2);
+    pnlEl.className = 'stat-val ' + pnlClass(d.total_pnl);
+    document.getElementById('stat-trades').textContent  = d.total_trades;
+    document.getElementById('stat-winrate').textContent = d.win_rate_pct + '%';
+    const wlEl = document.getElementById('stat-wl');
+    wlEl.innerHTML = `<span class="win">${d.wins}W</span> / <span class="loss">${d.losses}L</span>`;
+    wlEl.className = 'stat-val';
+    document.getElementById('stat-best').textContent   = '+' + fmt(d.best_pct, 2) + '%';
+    document.getElementById('stat-worst').textContent  = fmt(d.worst_pct, 2) + '%';
+    document.getElementById('last-update').textContent = 'Last tick: ' + (d.last_tick ? shortTime(d.last_tick) : '...');
+  } catch(e) {}
+}
+
+async function loadOpen() {
+  try {
+    const r = await fetch('/api/open');
+    const rows = await r.json();
+    const el = document.getElementById('open-positions');
+    if (!rows.length) { el.innerHTML = '<p class="text-slate-500 text-sm">No open positions</p>'; return; }
+    el.innerHTML = rows.map(t => `
+      <div class="flex items-center justify-between py-2 border-b border-slate-700">
+        <div class="flex items-center gap-2">
+          <span class="badge badge-${t.direction.toLowerCase()}">${t.direction}</span>
+          <span class="font-medium">${t.symbol}</span>
+        </div>
+        <div class="text-right text-xs">
+          <div class="text-slate-300">${fmt(t.entry_price, 5)}</div>
+          <div class="text-slate-500">${t.regime || ''} ${t.confidence}%</div>
+        </div>
+      </div>
+    `).join('');
+  } catch(e) {}
+}
+
+async function loadEquity() {
+  try {
+    const r = await fetch('/api/equity');
+    const rows = await r.json();
+    if (!rows.length) return;
+    const labels = rows.map(r => shortTime(r.timestamp));
+    const data   = rows.map(r => r.equity);
+    const ctx    = document.getElementById('equity-chart').getContext('2d');
+    if (equityChart) { equityChart.destroy(); }
+    equityChart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [{
+          label: 'Equity',
+          data,
+          borderColor: '#60a5fa',
+          backgroundColor: 'rgba(96,165,250,0.08)',
+          borderWidth: 2,
+          pointRadius: 0,
+          tension: 0.3,
+          fill: true,
+        }]
+      },
+      options: {
+        responsive: true,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { display: false },
+          y: { grid: { color: '#1e293b' }, ticks: { color: '#64748b' } }
+        }
+      }
+    });
+  } catch(e) {}
+}
+
+async function loadTrades() {
+  try {
+    const r = await fetch('/api/trades');
+    const rows = await r.json();
+    const body = document.getElementById('trades-body');
+    if (!rows.length) { body.innerHTML = '<tr><td colspan="11" class="text-slate-500 text-center py-4">No trades yet</td></tr>'; return; }
+    body.innerHTML = rows.map(t => {
+      const isOpen = t.status === 'OPEN';
+      const pnl    = isOpen ? null : t.pnl;
+      return `<tr>
+        <td class="text-slate-400">${shortTime(t.entry_time)}</td>
+        <td class="font-medium">${t.symbol}</td>
+        <td><span class="badge badge-${(t.direction||'').toLowerCase()}">${t.direction||'?'}</span></td>
+        <td>${fmt(t.entry_price,5)}</td>
+        <td>${isOpen ? '<span class="badge badge-open">OPEN</span>' : fmt(t.exit_price,5)}</td>
+        <td class="${pnlClass(pnl)}">${pnl != null ? (pnl>=0?'+':'')+fmt(pnl,2) : '...'}</td>
+        <td class="${pnlClass(pnl)}">${t.pnl_pct != null ? (t.pnl_pct>=0?'+':'')+fmt(t.pnl_pct,2)+'%' : '...'}</td>
+        <td>${t.outcome || (isOpen ? 'OPEN' : '...')}</td>
+        <td>${t.confidence}%</td>
+        <td class="text-slate-400 text-xs">${t.regime||'?'}</td>
+        <td class="text-slate-400">${t.hold_hours != null ? fmt(t.hold_hours,1)+'h' : '...'}</td>
+      </tr>`;
+    }).join('');
+  } catch(e) {}
+}
+
+async function loadTicks() {
+  try {
+    const r = await fetch('/api/ticks');
+    const rows = await r.json();
+    const body = document.getElementById('ticks-body');
+    if (!rows.length) { body.innerHTML = '<tr><td colspan="7" class="text-slate-500 text-center py-4">No ticks yet</td></tr>'; return; }
+    body.innerHTML = rows.map(t => {
+      const actionClass = t.pm_action === 'BUY' ? 'win' : t.pm_action === 'SELL' ? 'loss' : 'hold';
+      return `<tr>
+        <td class="text-slate-400">${shortTime(t.timestamp)}</td>
+        <td class="font-medium">${t.symbol}</td>
+        <td class="text-slate-400 text-xs">${t.regime||'?'}</td>
+        <td><span class="badge badge-${(t.tech_bias||'').toLowerCase() === 'buy' ? 'buy' : (t.tech_bias||'').toLowerCase() === 'sell' ? 'sell' : ''}">${t.tech_bias||'?'}</span></td>
+        <td class="${actionClass} font-semibold">${t.pm_action||'?'}</td>
+        <td>${t.pm_confidence}%</td>
+        <td class="text-slate-400 text-xs">${t.session||'...'}</td>
+      </tr>`;
+    }).join('');
+  } catch(e) {}
+}
+
+async function refresh() {
+  await Promise.all([loadStats(), loadOpen(), loadEquity(), loadTrades(), loadTicks()]);
+}
+
+refresh();
+setInterval(refresh, 30000);
+</script>
+</body>
+</html>

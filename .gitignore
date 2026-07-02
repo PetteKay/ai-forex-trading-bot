@@ -1,0 +1,41 @@
+# ── Secrets — NEVER commit ───────────────────────────────────────────────────
+.env
+*.key
+
+# ── Runtime artifacts (contain account numbers / trading history) ────────────
+*.log
+*.db
+*.db-wal
+*.db-shm
+observability/last_equity.json
+observability/reports/
+
+# ── Market data (multi-GB tick exports; regenerate or download separately) ───
+*_TICK_*.csv
+Market Watch*.csv
+signal-discovery/src/signal_discovery_workflow/data/
+
+# ── Discovered signals are per-user research output ──────────────────────────
+signal-discovery/src/signal_discovery_workflow/output/
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+
+# ── Virtual environments ─────────────────────────────────────────────────────
+.venv/
+.venv-nat/
+venv/
+env/
+
+# ── Local tooling / editor state ──────────────────────────────────────────────
+.claude/
+.agents/
+.impeccable/
+skills-lock.json
+*.bak
+outputs/
+.DS_Store

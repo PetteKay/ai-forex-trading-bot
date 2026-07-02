@@ -1,0 +1,48 @@
+# Signal Discovery config tuned for forex markets.
+# Run Phoenix first: uv run phoenix serve
+# Then: uv run nat run --config_file configs/config-forex.yml --input "momentum signals for forex"
+
+general:
+  telemetry:
+    tracing:
+      phoenix:
+        _type: phoenix
+        endpoint: http://localhost:6006/v1/traces
+        project: forex-signal-discovery
+
+llms:
+  signal_generator:
+    _type: nim
+    model_name: nvidia/nemotron-3-nano-30b-a3b
+    base_url: "https://integrate.api.nvidia.com/v1/"
+    temperature: 0.8
+    max_tokens: 4000
+
+  code_generator:
+    _type: nim
+    model_name: nvidia/nemotron-3-nano-30b-a3b
+    base_url: "https://integrate.api.nvidia.com/v1/"
+    temperature: 0.0
+    max_tokens: 3000
+
+  optimization_advisor:
+    _type: nim
+    model_name: nvidia/nemotron-3-nano-30b-a3b
+    base_url: "https://integrate.api.nvidia.com/v1/"
+    temperature: 0.5
+    max_tokens: 2000
+
+workflow:
+  _type: signal_optimizer
+  signal_generator_llm: signal_generator
+  code_generator_llm: code_generator
+  optimization_advisor_llm: optimization_advisor
+  # Forex signals typically need a lower IC bar than equities
+  ic_threshold: 0.015
+  p_value_threshold: 0.05
+  max_iterations: 5
+  num_signals: 3
+  # Forex: predict next-day (1d) or next-session (forward_periods=1)
+  forward_periods: 1
+  save_results: true
+  data_dir: "src/signal_discovery_workflow/data/forex"
