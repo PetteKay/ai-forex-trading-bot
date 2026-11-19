@@ -32,7 +32,7 @@ model, because liveness checking costs more.
 | Model | Distinct states | Result |
 |---|---|---|
 | RiskGovernor | 46,136 | no error |
-| OrderStateMachine | 249,601 (run with MaxPrice = 10; the committed MaxPrice = 20 model is about 4.7M states and needs a bigger machine) | no error |
+| OrderStateMachine | 4,246,401 (52 min) | no error |
 | PositionLifecycle | 5,550 | no error |
 | BotControl (safety) | 10,029,140 | no error |
 | BotControlLive (liveness) | 751,896 | no error |
