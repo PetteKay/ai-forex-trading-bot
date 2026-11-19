@@ -203,6 +203,9 @@ bot.py                    main loop (tick → gates → agent desk → order)
 config.py                 every tunable, heavily commented
 mt5_bridge.py             all MT5 I/O: candles, orders, deal history
 risk_governor.py          hard limits (TLA+-spec'd, Decimal money math)
+mcp_server.py             MCP server: Claude / Codex / ChatGPT trade and control the bot (MCP.md)
+bot_control.py            account lock, pause / stop / close / retrain requests, tighten-only settings
+trade_booking.py          books closed trades once (governor, journal, ML sample, lesson)
 position_manager.py       trailing SL, break-even, TP ladder, time exits
 agents/                   the 5 LLM agents + validated safe-default layer
 strategy/                 indicators, regime, S/R, pivots, discovered signals
@@ -212,7 +215,7 @@ data/                     calendar, news RSS, COT, macro context (isolated)
 observability/            trade journal, reporter, pattern miner
 signal-discovery/         NVIDIA NeMo alpha discovery (vendored, Apache-2.0)
 tests/                    pytest suite
-specs/                    TLA+ specifications
+specs/                    TLA+ specifications, TLC-checked (specs/README.md)
 ```
 
 ## Security notes
@@ -237,7 +240,7 @@ Issues and PRs welcome. The most valuable contributions right now:
 * Broker-compatibility reports (symbol suffixes, filling modes)
 * Additional TLA+ specs for the execution path
 
-Run `pytest tests/ -q` before submitting; all 42 tests must pass.
+Run `pytest tests/ -q` before submitting; every test must pass.
 
 ## License
 

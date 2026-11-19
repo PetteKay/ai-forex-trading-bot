@@ -50,6 +50,7 @@ class RiskGovernor:
         allowed_sessions: Optional[list] = None,
         state_path: Optional[str] = None,
         account_id: Optional[str] = None,
+        persist: bool = True,
     ):
         """
         state_path: JSON file where safety state is saved after every change and
@@ -60,6 +61,10 @@ class RiskGovernor:
         account_id: the MT5 account login. Each account gets its own state file
         (e.g. governor_state_12345.json), so switching accounts — demo to live —
         never applies one account's drawdown halt or peak equity to another.
+
+        persist=False: load the saved state but never write it. The MCP server
+        uses this while bot.py holds the account (bot_control.py, INV-BC-1):
+        it can report the limits without overwriting the running bot's file.
         """
         self._starting_equity    = Decimal(str(starting_equity))
         self._peak_equity        = Decimal(str(starting_equity))
@@ -82,6 +87,7 @@ class RiskGovernor:
             _root, _ext = os.path.splitext(state_path)
             state_path = f"{_root}_{self._account_id}{_ext or '.json'}"
         self._state_path         = state_path
+        self._persist            = persist
         self._last_saved: Optional[dict] = None
         if state_path:
             self._load_state()
@@ -286,7 +292,7 @@ class RiskGovernor:
         }
 
     def _save_state(self) -> None:
-        if not self._state_path:
+        if not self._state_path or not self._persist:
             return
         snap = self._snapshot()
         if snap == self._last_saved:
