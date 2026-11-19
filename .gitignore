@@ -41,3 +41,8 @@ skills-lock.json
 *.bak
 outputs/
 .DS_Store
+
+# TLC model-checker output
+specs/states/
+specs/*_TTrace_*
+specs/*.out

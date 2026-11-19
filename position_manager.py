@@ -29,6 +29,13 @@ import mt5_bridge as mt5b
 log = logging.getLogger("PositionManager")
 
 
+def _tightens(is_buy: bool, current_sl: float, new_sl: float) -> bool:
+    """True if new_sl reduces risk: higher for a BUY, lower for a SELL (0 = no SL yet)."""
+    if not current_sl:
+        return True
+    return new_sl > current_sl if is_buy else new_sl < current_sl
+
+
 class PositionManager:
     def __init__(self, cfg):
         self._cfg = cfg
@@ -185,14 +192,22 @@ class PositionManager:
                         f"Ticket {ticket}: TP ladder TIER1 — closed {t1_vol} lots "
                         f"at +{pips_profit:.1f} pips (1R = {t1_pips:.0f} pips)"
                     )
-                    # Move SL to break-even
+                    # Move SL to break-even — only if that tightens it. The trailing
+                    # stop may already have moved it past entry; going "to break-even"
+                    # would then widen the risk (TLC counterexample to INV-PL-1,
+                    # specs/PositionLifecycle.tla). Re-read: trailing ran this tick.
                     be_sl = round(
                         pos.price_open + pip_size if is_buy
                         else pos.price_open - pip_size,
                         sym_info.digits,
                     )
-                    mt5b.modify_position_sl(ticket, symbol, be_sl)
-                    log.info(f"Ticket {ticket}: SL → break-even after tier1 ({be_sl:.5f})")
+                    now = mt5.positions_get(ticket=ticket)
+                    cur_sl = now[0].sl if now else pos.sl
+                    if _tightens(is_buy, cur_sl, be_sl):
+                        mt5b.modify_position_sl(ticket, symbol, be_sl)
+                        log.info(f"Ticket {ticket}: SL → break-even after tier1 ({be_sl:.5f})")
+                    else:
+                        log.info(f"Ticket {ticket}: SL {cur_sl:.5f} already past break-even — kept")
 
         # ── Tier 2: close second tranche ─────────────────────────────────────
         elif pips_profit >= t2_pips and 0.40 < vol_ratio <= 0.85:
