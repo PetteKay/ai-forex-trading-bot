@@ -152,24 +152,33 @@ def _governor(equity: float) -> RiskGovernor:
 def _book_closed_trades(gov: RiskGovernor) -> list[dict]:
     """
     Book trades that have closed since the last check — closed by close_position,
-    by their stop loss / take profit, or while the server was not running — so
-    the governor's daily loss cap sees the real result (as bot.py does).
+    by their stop loss / take profit, or while the server was not running — and
+    learn from them exactly as bot.py does (memory/trade_learning.py):
+
+      daily loss cap (governor) · journal · setup blacklist · ML-gate training
+      sample + online update · periodic retrain · Telegram alert · lesson
 
     Source: journal rows still OPEN whose ticket is no longer an open MT5
     position. Each is booked once (the journal row is then CLOSED). Its P&L
     counts toward today's limit only if the trade closed today (UTC).
     """
     from datetime import datetime, timezone
-    journal = _journal()
+    from agents import reflection
+    from memory.trade_learning import (classify_outcome, update_blacklist,
+                                       save_training_sample, regime_of)
+    journal, memory = _journal(), _memory()
     with _MT5_LOCK:
         open_now = {p["ticket"] for p in mt5b.get_all_open_positions(_magic())}
+        equity = mt5b.get_account_equity()
     booked = []
-    today = datetime.now(timezone.utc).date()
+    now = datetime.now(timezone.utc)
+    today = now.date()
     for row in journal.get_recent_trades(200):
         if row.get("status") != "OPEN" or row["ticket"] in open_now:
             continue
+        ticket, sym = row["ticket"], row["symbol"]
         with _MT5_LOCK:
-            closed = mt5b.get_closed_trade(row["ticket"], max_wait_secs=0)
+            closed = mt5b.get_closed_trade(ticket, max_wait_secs=0)
         if not closed:
             continue          # history not available yet — try again next time
         net = float(closed.get("net_pnl", 0.0))
@@ -179,37 +188,107 @@ def _book_closed_trades(gov: RiskGovernor) -> list[dict]:
             if et is not None:
                 ts = et.replace(tzinfo=timezone.utc).timestamp() if et.tzinfo is None else et.timestamp()
                 with _MT5_LOCK:
-                    exit_utc = mt5b.terminal_time_to_utc(int(ts), row["symbol"])
+                    exit_utc = mt5b.terminal_time_to_utc(int(ts), sym)
         except Exception:
             exit_utc = None
         if exit_utc is not None:
             counts_today = exit_utc.date() == today
         else:   # offset not measurable (market closed): fall back to the entry date
             counts_today = str(row.get("entry_time", ""))[:10] == today.isoformat()
+
+        snap = memory.get_open_context(ticket) or {}
+        ctx  = snap.get("context") or {}
+        risk_usd   = float(snap.get("risk_usd") or 0.0)
+        r_multiple = (net / risk_usd) if risk_usd > 0 else 0.0
+        outcome    = classify_outcome(r_multiple)
+        pnl_pct    = (net / equity) * 100 if equity else 0.0
         try:
-            hold = 0.0
-            if row.get("entry_time"):
-                hold = (datetime.now(timezone.utc)
-                        - datetime.fromisoformat(row["entry_time"])).total_seconds() / 3600
+            entry_dt = datetime.fromisoformat(snap.get("entry_time") or row.get("entry_time"))
         except Exception:
-            hold = 0.0
-        journal.log_trade_close(ticket=row["ticket"], exit_price=closed.get("exit_price", 0.0),
-                                pnl=net, pnl_pct=0.0,
-                                outcome="WIN" if net > 0 else "LOSS" if net < 0 else "BREAKEVEN",
+            entry_dt = now
+        hold = (now - entry_dt).total_seconds() / 3600
+        direction = snap.get("direction") or row.get("direction")
+
+        journal.log_trade_close(ticket=ticket, exit_price=closed.get("exit_price", 0.0),
+                                pnl=net, pnl_pct=pnl_pct, outcome=outcome,
                                 hold_hours=round(hold, 2), exit_reason="MCP_SYNC")
         if counts_today:
             gov.record_trade_closed(net)
-        booked.append({"ticket": row["ticket"], "symbol": row["symbol"], "net_pnl": net,
-                       "counted_in_today": counts_today})
-        log.info(f"Booked closed trade {row['ticket']} {row['symbol']}: {net:+.2f}"
+        update_blacklist(journal, config, sym, regime_of(ctx), net > 0)
+
+        sample = save_training_sample(
+            memory, _meta_gate(), ticket=ticket, symbol=sym, direction=direction,
+            entry_time=entry_dt, exit_time=exit_utc or now, entry_context=ctx,
+            r_multiple=r_multiple, pnl_pct=pnl_pct, outcome=outcome, is_win=net > 0)
+        if sample:
+            _lazy["since_retrain"] = _lazy.get("since_retrain", 0) + 1
+            if _lazy["since_retrain"] >= getattr(config, "META_RETRAIN_EVERY", 20):
+                _meta_gate().train(memory.get_all_for_training(),
+                                   training_lookback_days=getattr(config, "ML_TRAINING_LOOKBACK_DAYS", 180))
+                _lazy["since_retrain"] = 0
+
+        lesson = _lesson_for(reflection, ticket, sym, direction, snap, ctx, row, closed,
+                             pnl_pct, r_multiple, outcome, hold) if ctx else "no entry snapshot"
+        memory.delete_open_context(ticket)
+        try:
+            _telegram().trade_close(symbol=sym, direction=direction, outcome=outcome, pnl=net,
+                                    r_multiple=r_multiple, hold_hours=hold)
+        except Exception:
+            pass
+        booked.append({"ticket": ticket, "symbol": sym, "net_pnl": net, "r_multiple": round(r_multiple, 2),
+                       "outcome": outcome, "counted_in_today": counts_today,
+                       "ml_sample": bool(sample), "lesson": lesson})
+        log.info(f"Booked closed trade {ticket} {sym}: {net:+.2f} ({outcome}, R={r_multiple:+.2f})"
                  f"{'' if counts_today else ' (not today — journal only)'}")
     return booked
+
+
+def _lesson_for(reflection, ticket, sym, direction, snap, ctx, row, closed,
+                pnl_pct, r_multiple, outcome, hold) -> str:
+    """Same selectivity as bot.py's reflection. Returns what happened."""
+    pm   = snap.get("pm") or {}
+    tech = snap.get("tech") or {}
+    if not reflection._pre_filter(r_multiple, int(pm.get("confidence", 0) or 0), outcome):
+        return "nothing to learn (below the reflection filter)"
+    mode = str(getattr(config, "MCP_LESSONS", "client")).lower()
+    if mode == "llm" and getattr(config, "LLM_API_KEY", ""):
+        from agents import base as llm
+        from memory.trade_learning import lesson_fields
+        if not _lazy.get("llm_ready"):
+            llm.init(config)
+            _lazy["llm_ready"] = True
+        rec = reflection.reflect(symbol=sym, direction=direction,
+                                 entry_price=float(snap.get("entry_price") or row.get("entry_price") or 0),
+                                 exit_price=float(closed.get("exit_price", 0.0)), pnl_pct=pnl_pct,
+                                 r_multiple=r_multiple, hold_hours=hold, outcome=outcome,
+                                 entry_context=ctx, technical_analysis=tech, pm_decision=pm, cfg=config)
+        if not rec:
+            return "reflection agent: nothing worth saving"
+        rec.update(lesson_fields(ctx, r_multiple, snap.get("entry_time")))
+        return "saved by reflection agent" if _memory().save(rec) else "below usefulness threshold"
+    _memory().queue_review(ticket, {
+        "symbol": sym, "direction": direction,
+        "entry_price": snap.get("entry_price") or row.get("entry_price"),
+        "exit_price": closed.get("exit_price"), "pnl_pct": round(pnl_pct, 3),
+        "r_multiple": round(r_multiple, 2), "outcome": outcome, "hold_hours": round(hold, 1),
+        "entry_time": snap.get("entry_time"), "reason_at_entry": snap.get("reason", ""),
+        "source": snap.get("source", ""), "entry_context": ctx, "tech": tech, "pm": pm,
+    })
+    return "queued for review — call get_trades_to_review, then save_lesson"
 
 
 def _get(name, factory):
     if name not in _lazy:
         _lazy[name] = factory()
     return _lazy[name]
+
+
+def _telegram():
+    from notifications.telegram_alert import TelegramAlert
+    return _get("telegram", lambda: TelegramAlert(
+        token=getattr(config, "TELEGRAM_BOT_TOKEN", ""),
+        chat_id=getattr(config, "TELEGRAM_CHAT_ID", ""),
+        enabled=getattr(config, "TELEGRAM_ALERTS_ENABLED", False)))
 
 
 def _memory():
@@ -380,6 +459,46 @@ def _plan(symbol: str, direction: str, size_multiplier: float) -> dict:
             sl_mult, tp_mult = sp.get("ATR_SL_MULT", sl_mult), sp.get("ATR_TP_MULT", tp_mult)
     except Exception:
         pass
+    # ── What the bot has learned (same rules as bot.py) ──────────────────
+    from memory.trade_learning import loss_streak
+    from strategy.position_sizing import kelly_fraction
+    adjustments = []
+    regime_name = ctx["regime"].get("regime", "")
+    if getattr(config, "SETUP_BLACKLIST_ENABLED", False):
+        th = getattr(config, "SETUP_BLACKLIST_THRESHOLD", 3)
+        if _journal().is_blacklisted(sym, regime_name, th):
+            blockers.append(f"Setup blacklist: {th}+ consecutive losses on {sym} in "
+                            f"{regime_name} (cleared by the next win).")
+    ml = _meta_gate().predict(feature_vector(ctx), ctx, direction=direction)
+    min_p = config.META_LABEL_MIN_PROB
+    if ml["probability"] < min_p:
+        blockers.append(f"ML gate: win probability {ml['probability']:.3f} < {min_p} "
+                        f"({'model' if ml['use_ml'] else 'heuristic'}).")
+    if getattr(config, "USE_KELLY_SIZING", True) and ml.get("use_ml"):
+        frac = kelly_fraction(ml["probability"], tp_mult / sl_mult if sl_mult > 0 else 0,
+                              getattr(config, "KELLY_FRACTION", 0.25))
+        if frac <= 0:
+            blockers.append("Kelly: no edge at these odds.")
+        elif frac < size_multiplier:
+            adjustments.append(f"Kelly {size_multiplier:.2f} → {frac:.2f}")
+            size_multiplier = frac
+    if getattr(config, "LOSS_STREAK_ENABLED", False):
+        streak = loss_streak(_journal(), sym)
+        if streak >= getattr(config, "LOSS_STREAK_THRESHOLD", 3):
+            m = getattr(config, "LOSS_STREAK_SIZE_MULT", 0.5)
+            adjustments.append(f"Loss streak {streak} → size × {m}")
+            size_multiplier *= m
+    if getattr(config, "VOL_ADJUSTED_SIZING", False):
+        atr_p = ctx.get("atr_percentile", 50)
+        if atr_p >= getattr(config, "VOL_SIZING_EXTREME_ATR_PCT", 92):
+            m = getattr(config, "VOL_SIZING_EXTREME_ATR_MULT", 0.50)
+            adjustments.append(f"Extreme volatility (ATR {atr_p:.0f}th pct) → size × {m}")
+            size_multiplier *= m
+        elif atr_p >= getattr(config, "VOL_SIZING_HIGH_ATR_PCT", 80):
+            m = getattr(config, "VOL_SIZING_HIGH_ATR_MULT", 0.70)
+            adjustments.append(f"High volatility (ATR {atr_p:.0f}th pct) → size × {m}")
+            size_multiplier *= m
+
     point     = float(getattr(info, "point", 0.00001) or 0.00001)
     sl_points = round(ctx["atr"] / point * sl_mult, 1)
     tp_points = round(ctx["atr"] / point * tp_mult, 1)
@@ -406,34 +525,42 @@ def _plan(symbol: str, direction: str, size_multiplier: float) -> dict:
         "take_profit": round(price + sign * tp_points * point, 6),
         "sl_points": sl_points, "tp_points": tp_points,
         "risk_usd_if_stopped": round(risk_usd, 2) if risk_usd is not None else None,
-        "regime": ctx["regime"].get("regime"), "_ctx": ctx, "_gov": gov,
+        "regime": ctx["regime"].get("regime"),
+        "ml_gate": {"probability": ml["probability"], "min": min_p, "model": ml.get("model_type"),
+                    "trained_on": ml.get("n_samples", 0)},
+        "size_multiplier": round(size_multiplier, 4), "size_adjustments": adjustments,
+        "_ctx": ctx, "_gov": gov,
     }
 
 
 @server.tool(annotations=READ_ONLY)
 def preview_trade(symbol: str, direction: str, size_multiplier: float = 1.0) -> dict:
-    """Check a BUY or SELL against every rule the bot uses (risk governor, calendar
-    blackout, duplicate and correlation guards, spread, position sizing) and show
-    the lot, stop loss, take profit and money at risk. Sends no order."""
+    """Check a BUY or SELL against every rule the bot uses — risk governor, calendar
+    blackout, duplicate and correlation guards, spread, setup blacklist, ML gate,
+    Kelly, loss-streak and volatility sizing — and show the lot, stop loss, take
+    profit and money at risk. Sends no order."""
     plan = _plan(symbol, direction, size_multiplier)
     return _jsonable(plan)
 
 
 @server.tool(annotations=DESTRUCTIVE)
 def place_trade(symbol: str, direction: str, size_multiplier: float = 1.0,
-                reason: str = "") -> dict:
+                reason: str = "", confidence: int = 0) -> dict:
     """Open a market BUY or SELL with the bot's ATR stop loss and take profit.
     Runs every check in preview_trade first and refuses if any fails. In
     config.MCP_TRADING_MODE = "dry_run" (the default) it only reports what it
-    would do. `reason`: a short note saved with the trade."""
+    would do. `reason`: why you are taking the trade (saved, and shown again when
+    the trade is reviewed). `confidence`: your confidence 0-100 (used, like the
+    bot's Fund Manager confidence, to decide which trades are worth a lesson)."""
     blocked = _trading_block_reason()
     if blocked:
         return {"placed": False, "error": blocked}
     with _TRADE_LOCK:
-        return _place_locked(symbol, direction, size_multiplier, reason)
+        return _place_locked(symbol, direction, size_multiplier, reason, confidence)
 
 
-def _place_locked(symbol: str, direction: str, size_multiplier: float, reason: str) -> dict:
+def _place_locked(symbol: str, direction: str, size_multiplier: float, reason: str,
+                  confidence: int = 0) -> dict:
     plan = _plan(symbol, direction, size_multiplier)
     ctx, gov = plan["_ctx"], plan["_gov"]
     if not plan["allowed"]:
@@ -450,14 +577,42 @@ def _place_locked(symbol: str, direction: str, size_multiplier: float, reason: s
     if not result:
         return _jsonable({"placed": False, "error": "MT5 rejected the order (see server log).", **plan})
     gov.record_order_placed()
+    confidence = max(0, min(100, int(confidence or 0)))
     try:
         _journal().log_trade_open(
             ticket=result["ticket"], symbol=plan["symbol"], direction=plan["direction"],
             entry_price=result["price"], sl=result["sl"], tp=result["tp"],
-            volume=plan["lot"], confidence=0, regime=plan["regime"] or "",
-            fingerprint=market_fingerprint(ctx), size_multiplier=size_multiplier)
+            volume=plan["lot"], confidence=confidence, regime=plan["regime"] or "",
+            fingerprint=market_fingerprint(ctx), size_multiplier=plan.get("size_multiplier", 1.0))
     except Exception as e:
         log.warning(f"Journal write failed: {e}")
+    # Entry snapshot — what the lesson and the ML training sample are built from
+    try:
+        from datetime import datetime, timezone
+        from memory.trade_learning import json_safe_context
+        risk_usd = 0.0
+        try:
+            with _MT5_LOCK:
+                risk_usd = mt5b.get_risk_usd(plan["symbol"], result["price"], result["sl"], plan["lot"])
+        except Exception as e:      # the plan's own risk figure is the fallback
+            log.warning(f"MT5 risk calc failed, using the plan's risk: {e}")
+        _memory().save_open_context(
+            result["ticket"], symbol=plan["symbol"], direction=plan["direction"],
+            entry_time=datetime.now(timezone.utc).isoformat(), entry_price=result["price"],
+            risk_usd=risk_usd or plan.get("risk_usd_if_stopped") or 0.0,
+            context=json_safe_context(ctx),
+            tech={"summary": f"MCP client analysis: {reason}"[:500]},
+            pm={"action": plan["direction"], "confidence": confidence, "reasoning": reason[:1000]},
+            source="mcp", reason=reason[:1000])
+    except Exception as e:
+        log.warning(f"Entry snapshot not stored (no lesson/ML sample for this trade): {e}", exc_info=True)
+    try:
+        _telegram().trade_open(symbol=plan["symbol"], direction=plan["direction"],
+                               entry_price=result["price"], sl=result["sl"], tp=result["tp"],
+                               lot=plan["lot"], confidence=confidence,
+                               regime=plan["regime"] or "", reasoning=reason[:120])
+    except Exception:
+        pass
     log.warning(f"MCP order placed: {plan['direction']} {plan['lot']} {plan['symbol']} "
                 f"ticket={result['ticket']} reason={reason[:120]!r}")
     return _jsonable({"placed": True, "ticket": result["ticket"], "entry": result["price"],
@@ -484,6 +639,89 @@ def close_position(ticket: int) -> dict:
         equity = mt5b.get_account_equity()
     booked = _book_closed_trades(_governor(equity)) if ok else []
     return _jsonable({"closed": bool(ok), "position": pos, "booked": booked})
+
+
+# ── Lessons (the connected AI does the bot's reflection) ──────────────────
+
+_LESSON_CATEGORIES = ("ENTRY_TIMING", "EXIT_TIMING", "REGIME_FILTER", "RISK_MANAGEMENT",
+                      "VOLATILITY", "SESSION")
+_LESSON_GUIDE = (
+    "You are the bot's trading coach. Be extremely selective: save a lesson only if it is "
+    "specific enough that a trader reading it knows exactly what to do differently. Never "
+    "save generic advice ('wait for confirmation', 'follow the trend'). Usefulness: 0.8-1.0 "
+    "counterintuitive result, critical failure or a setup that clearly works/fails under "
+    "specific conditions; 0.6-0.8 clear lesson that should change behaviour; 0.4-0.6 mild, "
+    "save only if new; below 0.5 not worth saving. Lessons below the bot's usefulness "
+    "threshold are not stored. Categories: " + ", ".join(_LESSON_CATEGORIES) + "."
+)
+_REVIEW_KEYS = ("market_structure", "sessions", "rsi", "rsi_state", "ema_cross_up",
+                "ema_cross_down", "fast_above_slow", "price_above_trend", "macd_positive",
+                "bb_pct", "atr_percentile", "bb_squeeze", "regime", "candlestick_patterns")
+
+
+@server.tool(annotations=READ_ONLY)
+def get_trades_to_review(count: int = 5) -> dict:
+    """Closed trades waiting for a lesson (the review the bot's reflection agent does).
+    For each: the result, the market state at entry and the reason given at entry.
+    Write the lesson with save_lesson, or call it with should_save=false."""
+    booked = _book_closed_trades(_governor(mt5b_equity()))
+    out = []
+    for r in _memory().pending_reviews(max(1, min(count, 20))):
+        ctx = r.pop("entry_context", {}) or {}
+        r["market_state_at_entry"] = {k: ctx.get(k) for k in _REVIEW_KEYS if k in ctx}
+        r.pop("tech", None)
+        out.append(r)
+    return _jsonable({"guide": _LESSON_GUIDE, "trades": out, "newly_booked": booked,
+                      "usefulness_threshold": config.MEMORY_USEFULNESS_THRESHOLD})
+
+
+@server.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False,
+                                         idempotent_hint=True, open_world_hint=False))
+def save_lesson(ticket: int, lesson: str, usefulness_score: float, category: str,
+                pattern_name: str = "", should_save: bool = True) -> dict:
+    """Save the lesson from a reviewed trade into the bot's memory — recalled before
+    future trades by bot.py and by recall_lessons. usefulness_score 0-1; category one
+    of ENTRY_TIMING, EXIT_TIMING, REGIME_FILTER, RISK_MANAGEMENT, VOLATILITY, SESSION.
+    Use should_save=false when the trade taught nothing new."""
+    from memory.trade_learning import lesson_fields
+    from strategy.indicators import market_fingerprint as fingerprint
+    mem = _memory()
+    rev = mem.get_review(ticket)
+    if rev is None:
+        return {"saved": False, "error": f"Trade {ticket} is not waiting for a review."}
+    if rev.get("status") != "PENDING":
+        return {"saved": False, "error": f"Trade {ticket} was already reviewed ({rev['status']})."}
+    if not should_save:
+        mem.complete_review(ticket, "SKIPPED")
+        return {"saved": False, "status": "SKIPPED"}
+    category = (category or "").upper()
+    if category not in _LESSON_CATEGORIES:
+        return {"saved": False, "error": f"category must be one of {', '.join(_LESSON_CATEGORIES)}"}
+    lesson = (lesson or "").strip()
+    if len(lesson) < 15:
+        return {"saved": False, "error": "Lesson too short — be specific (15+ characters)."}
+    score = max(0.0, min(1.0, float(usefulness_score)))
+    ctx = rev.get("entry_context") or {}
+    record = {
+        "symbol": rev["symbol"], "direction": rev["direction"],
+        "entry_price": rev.get("entry_price") or 0.0, "exit_price": rev.get("exit_price") or 0.0,
+        "pnl_pct": rev.get("pnl_pct") or 0.0, "outcome": rev.get("outcome"),
+        "fingerprint": fingerprint(ctx), "market_context": ctx,
+        "agent_reasoning": f"MCP: {rev.get('reason_at_entry', '')}"[:2000],
+        "lesson": lesson, "usefulness_score": score,
+        "pattern_name": pattern_name or None, "category": category,
+    }
+    record.update(lesson_fields(ctx, float(rev.get("r_multiple") or 0.0), rev.get("entry_time")))
+    saved = mem.save(record)
+    mem.complete_review(ticket, "SAVED" if saved else "BELOW_THRESHOLD")
+    return {"saved": bool(saved), "status": "SAVED" if saved else "BELOW_THRESHOLD",
+            "usefulness_threshold": config.MEMORY_USEFULNESS_THRESHOLD}
+
+
+def mt5b_equity() -> float:
+    with _MT5_LOCK:
+        _mt5_ready()
+        return mt5b.get_account_equity()
 
 
 # ── HTTP auth (ChatGPT supports OAuth or no auth — not API-key headers) ─────

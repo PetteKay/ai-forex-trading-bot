@@ -65,7 +65,11 @@ class MCPInProcess(unittest.TestCase):
             LIVE_CALENDAR_ENABLED=False, CALENDAR_CSV_PATH=os.path.join(self.tmp, "none.csv"),
             ALLOWED_SESSIONS=[], SPREAD_FILTER_ENABLED=False, SIZING_MODE="risk_pct",
             RISK_PER_TRADE_PCT=0.5, MCP_TRADING_MODE="dry_run", MCP_HTTP_ALLOW_TRADING=False,
-            MAX_OPEN_POSITIONS=5, MAX_ORDERS_PER_DAY=10).items()]
+            MAX_OPEN_POSITIONS=5, MAX_ORDERS_PER_DAY=10, META_LABEL_MIN_PROB=0.0,
+            LOSS_STREAK_ENABLED=False, VOL_ADJUSTED_SIZING=False, MCP_LESSONS="client",
+            LLM_API_KEY="", SETUP_BLACKLIST_ENABLED=False, SETUP_BLACKLIST_THRESHOLD=3,
+            LOSS_STREAK_THRESHOLD=3, LOSS_STREAK_SIZE_MULT=0.5,
+            TELEGRAM_ALERTS_ENABLED=False).items()]
         for p in self.patches:
             p.start()
         self.config = config
@@ -116,11 +120,13 @@ class MCPInProcess(unittest.TestCase):
         tools = {t.name: t for t in self.list_tools()}
         expected = {"get_account_status", "analyze_market", "get_news", "get_ml_probability",
                     "recall_lessons", "get_recent_trades", "preview_trade", "place_trade",
-                    "close_position"}
+                    "close_position", "get_trades_to_review", "save_lesson"}
         self.assertEqual(set(tools), expected)
         for n in ("place_trade", "close_position"):
             self.assertTrue(tools[n].annotations.destructive_hint)
-        for n in expected - {"place_trade", "close_position"}:
+        self.assertFalse(tools["save_lesson"].annotations.read_only_hint)
+        self.assertFalse(tools["save_lesson"].annotations.destructive_hint)
+        for n in expected - {"place_trade", "close_position", "save_lesson"}:
             self.assertTrue(tools[n].annotations.read_only_hint)
 
     def test_account_and_market(self):
@@ -233,6 +239,141 @@ class MCPInProcess(unittest.TestCase):
         [t.start() for t in ts]; [t.join() for t in ts]
         self.assertEqual(sum(1 for r in results if r.get("placed")), 1, results)
         self.assertEqual(len(self.fake.orders_sent), 1)
+
+
+    # ── MCP trades learn like bot.py trades ──────────────────────────────
+    def _db_rows(self, sql, *args):
+        import sqlite3
+        with sqlite3.connect(self.config.MEMORY_DB_PATH) as con:
+            con.row_factory = sqlite3.Row
+            return [dict(r) for r in con.execute(sql, args)]
+
+    def _open_and_close(self, profit, confidence=70, reason="EMA cross up, London open"):
+        self.config.MCP_TRADING_MODE = "live"
+        r = self.call("place_trade", symbol="EURUSD", direction="BUY",
+                      reason=reason, confidence=confidence)
+        self.assertTrue(r["placed"], r)
+        snap = self.srv._memory().get_open_context(r["ticket"])
+        self.assertEqual(snap["source"], "mcp")
+        self.assertEqual(snap["pm"]["confidence"], confidence)
+        self.assertGreater(snap["risk_usd"], 0)
+        self.assertIn("rsi", snap["context"])
+        self.fake.next_close_profit[0] = profit
+        closed = self.call("close_position", ticket=r["ticket"])
+        self.assertTrue(closed["closed"])
+        return r["ticket"], snap, closed["booked"][0]
+
+    def test_mcp_close_feeds_ml_gate_journal_and_review_queue(self):
+        t, snap, b = self._open_and_close(-60.0)
+        r_expected = -60.0 / snap["risk_usd"]
+        self.assertAlmostEqual(b["r_multiple"], round(r_expected, 2))
+        self.assertTrue(b["ml_sample"])
+        self.assertIn("queued for review", b["lesson"])
+        ml = self._db_rows("SELECT * FROM ml_samples WHERE ticket=?", t)
+        self.assertEqual(len(ml), 1)
+        self.assertEqual(ml[0]["direction"], "BUY")
+        self.assertAlmostEqual(ml[0]["r_multiple"], r_expected, places=6)
+        self.assertEqual(ml[0]["outcome"], b["outcome"])
+        jr = next(x for x in self.srv._journal().get_recent_trades(10) if x["ticket"] == t)
+        self.assertEqual(jr["status"], "CLOSED")
+        self.assertEqual(jr["outcome"], b["outcome"])
+        self.assertEqual(jr["confidence"], 70)
+        self.assertIsNone(self.srv._memory().get_open_context(t), "snapshot not cleaned up")
+        rv = self.call("get_trades_to_review")
+        self.assertEqual([x["ticket"] for x in rv["trades"]], [t])
+        tr = rv["trades"][0]
+        self.assertEqual(tr["reason_at_entry"], "EMA cross up, London open")
+        self.assertIn("rsi", tr["market_state_at_entry"])
+        self.assertIn("guide", rv)
+
+    def test_saved_lesson_is_recalled_and_reviewed_once(self):
+        t, _, _ = self._open_and_close(-60.0)
+        lesson = "EURUSD longs on an EMA cross straight into London open got stopped; wait for the first 15m retest."
+        bad = self.call("save_lesson", ticket=t, lesson=lesson, usefulness_score=0.8, category="NOPE")
+        self.assertFalse(bad["saved"])
+        ok = self.call("save_lesson", ticket=t, lesson=lesson, usefulness_score=0.8,
+                       category="entry_timing", pattern_name="london-open-chase")
+        self.assertTrue(ok["saved"], ok)
+        row = self._db_rows("SELECT * FROM memories WHERE lesson=?", lesson)[0]
+        self.assertEqual(row["category"], "ENTRY_TIMING")
+        self.assertEqual(row["ml_sampled"], 1, "lesson would be counted twice in ML training")
+        self.assertIsNotNone(row["feature_vector"])
+        rec = self.call("recall_lessons", symbol="EURUSD")
+        self.assertIn(lesson, [m["lesson"] for m in rec["lessons"]])
+        again = self.call("save_lesson", ticket=t, lesson=lesson, usefulness_score=0.8,
+                          category="ENTRY_TIMING")
+        self.assertFalse(again["saved"])
+        self.assertIn("already reviewed", again["error"])
+        self.assertEqual(self.call("get_trades_to_review")["trades"], [])
+
+    def test_skipped_and_low_score_lessons_are_not_stored(self):
+        t1, _, _ = self._open_and_close(-60.0)
+        self.assertEqual(self.call("save_lesson", ticket=t1, lesson="x", usefulness_score=0,
+                                   category="", should_save=False)["status"], "SKIPPED")
+        t2, _, _ = self._open_and_close(-60.0)
+        low = self.call("save_lesson", ticket=t2, lesson="Generic: wait for confirmation next time.",
+                        usefulness_score=0.1, category="ENTRY_TIMING")
+        self.assertFalse(low["saved"])
+        self.assertEqual(self._db_rows("SELECT * FROM memories"), [])
+
+    def test_llm_mode_uses_the_bots_reflection_agent(self):
+        from agents import base, reflection
+        self.config.MCP_LESSONS = "llm"
+        self.config.LLM_API_KEY = "test-key"
+        seen = {}
+
+        def fake_reflect(**kw):
+            seen.update(kw)
+            return {"symbol": kw["symbol"], "direction": kw["direction"], "entry_price": kw["entry_price"],
+                    "exit_price": kw["exit_price"], "pnl_pct": kw["pnl_pct"], "outcome": kw["outcome"],
+                    "fingerprint": "fp", "market_context": kw["entry_context"], "agent_reasoning": "r",
+                    "lesson": "Reflection agent lesson about the London open chase.",
+                    "usefulness_score": 0.9, "pattern_name": "p", "category": "ENTRY_TIMING"}
+        with mock.patch.object(base, "init") as init, \
+             mock.patch.object(reflection, "reflect", side_effect=fake_reflect):
+            t, _, b = self._open_and_close(-60.0, confidence=85)
+        init.assert_called_once()
+        self.assertEqual(b["lesson"], "saved by reflection agent")
+        self.assertEqual(seen["pm_decision"]["confidence"], 85)
+        self.assertIn("rsi", seen["entry_context"])
+        row = self._db_rows("SELECT * FROM memories")[0]
+        self.assertEqual(row["ml_sampled"], 1)
+        self.assertEqual(self.call("get_trades_to_review")["trades"], [])
+
+    def test_learned_rules_apply_to_mcp_orders(self):
+        # ML gate threshold
+        self.config.META_LABEL_MIN_PROB = 0.99
+        p = self.call("preview_trade", symbol="EURUSD", direction="BUY")
+        self.assertFalse(p["allowed"])
+        self.assertTrue(any("ML gate" in x for x in p["blockers"]), p["blockers"])
+        self.config.META_LABEL_MIN_PROB = 0.0
+        # setup blacklist, built from the regime the MCP trade was taken in
+        self.config.SETUP_BLACKLIST_ENABLED = True
+        self.config.SETUP_BLACKLIST_THRESHOLD = 2
+        regime = p["regime"]
+        for _ in range(2):
+            self.srv._journal().add_blacklist_loss("EURUSD", regime)
+        p = self.call("preview_trade", symbol="EURUSD", direction="BUY")
+        self.assertTrue(any("Setup blacklist" in x for x in p["blockers"]), p["blockers"])
+        self.srv._journal().reset_blacklist("EURUSD", regime)
+        # loss streak halves the size
+        self.config.LOSS_STREAK_ENABLED = True
+        self.config.LOSS_STREAK_THRESHOLD = 1
+        self.config.LOSS_STREAK_SIZE_MULT = 0.5
+        full = self.call("preview_trade", symbol="EURUSD", direction="BUY")
+        self.assertEqual(full["size_multiplier"], 1.0)
+        self._open_and_close(-60.0)
+        half = self.call("preview_trade", symbol="EURUSD", direction="BUY")
+        self.assertEqual(half["size_multiplier"], 0.5, half["size_adjustments"])
+        self.assertLess(half["lot"], full["lot"])
+
+    def test_mcp_losses_build_the_blacklist(self):
+        self.config.SETUP_BLACKLIST_ENABLED = True
+        self.config.SETUP_BLACKLIST_THRESHOLD = 2
+        self._open_and_close(-60.0)
+        self._open_and_close(-60.0)
+        p = self.call("preview_trade", symbol="EURUSD", direction="BUY")
+        self.assertTrue(any("Setup blacklist" in x for x in p["blockers"]), p["blockers"])
 
 
 class MCPStdio(unittest.TestCase):

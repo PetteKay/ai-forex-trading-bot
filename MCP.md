@@ -24,6 +24,7 @@ You ── "Analyse EURUSD and trade it if it qualifies" ──► Claude / Code
 | `MCP_TRADING_MODE` | `"dry_run"` | `"off"`: trading tools refuse. `"dry_run"`: `place_trade` only reports what it would do. `"live"`: sends orders. |
 | `MCP_HTTP_ALLOW_TRADING` | `False` | Over HTTP (ChatGPT), trading tools refuse unless this is `True`. Read-only tools always work. |
 | `SIZING_MODE` / `RISK_PER_TRADE_PCT` | `"fixed"` / `0.5` | Same sizing as the bot. `"risk_pct"` sizes every trade to a % of equity. |
+| `MCP_LESSONS` | `"client"` | Who writes lessons for trades closed over MCP. `"client"`: your AI app, via `get_trades_to_review` → `save_lesson` (no key needed). `"llm"`: the bot's own reflection agent (needs `LLM_API_KEY`). |
 
 Every `place_trade`, live or dry run, is checked against:
 - the **risk governor** (daily loss cap, kill switch, drawdown halt, max positions and orders per day). It reads `observability/governor_state_<account>.json`, so limits hit by the bot also block the MCP server, and the other way round. Each MT5 account has its own file.
@@ -32,6 +33,27 @@ Every `place_trade`, live or dry run, is checked against:
 - the **duplicate** and **correlation** guards
 - the **spread filter** (if enabled)
 - **position sizing**: it refuses rather than rounding a lot size up past the broker minimum
+- **what the bot has learned**, the same rules `bot.py` applies:
+  - the **setup blacklist** (N losses in a row on a symbol in the same regime)
+  - the **ML gate** (`META_LABEL_MIN_PROB`) and **Kelly** sizing from its win probability
+  - **loss-streak** and **volatility** size cuts
+
+  `preview_trade` shows the ML probability and every size cut it made.
+
+## MCP trades learn like the bot's own trades
+When a trade opened over MCP closes (by `close_position`, its stop loss / take profit, or while the server was off), the server books it the same way `bot.py` does:
+- the **journal** gets the result, outcome and R-multiple
+- the **governor** counts the P&L toward today's loss cap
+- the **setup blacklist** and **loss streak** are updated
+- the **ML gate** gets a training sample and an online update, and retrains every `META_RETRAIN_EVERY` closed trades. This uses the market state saved at entry, so it survives server restarts.
+- a **Telegram** alert is sent (if enabled)
+- a **lesson** is written for the trades worth learning from (the reflection agent's filter: stop losses, wins of 1.5R+, any move of 0.3R+, and confident calls that lost):
+  - `MCP_LESSONS = "client"`: the trade waits in a review queue. Ask your AI app to "review my closed trades". It calls `get_trades_to_review`, which shows the result, the reason you gave at entry and the market state then, and saves the lesson with `save_lesson`. Lessons under `MEMORY_USEFULNESS_THRESHOLD` aren't stored.
+  - `MCP_LESSONS = "llm"`: the bot's reflection agent writes it straight away.
+
+Saved lessons are recalled by `bot.py` before its own trades and by `recall_lessons`. Pass `reason` and `confidence` to `place_trade`: they are what the review sees.
+
+Lesson text is also embedded for meaning-based search through NVIDIA's embedding API, using `LLM_API_KEY`, so that part only works when `LLM_API_KEY` is an NVIDIA key. Without it, lessons are still saved and recalled by market fingerprint and feature similarity.
 
 **Don't let `bot.py` and the MCP server trade the same account at the same time.** Both write the governor state file, and a running `bot.py` won't manage (trail or time-exit) positions the MCP server opened until it restarts.
 
@@ -46,8 +68,10 @@ Every `place_trade`, live or dry run, is checked against:
 | `recall_lessons(symbol)` | Lessons saved from similar past trades |
 | `get_recent_trades(count)` | Recent trades from the journal |
 | `preview_trade(symbol, direction, size_multiplier)` | All checks, plus lot, stop loss, take profit and money at risk. No order. |
-| `place_trade(symbol, direction, size_multiplier, reason)` | Same checks, then an order (live mode only) |
+| `place_trade(symbol, direction, size_multiplier, reason, confidence)` | Same checks, then an order (live mode only) |
 | `close_position(ticket)` | Closes one of the bot's positions (live mode only) |
+| `get_trades_to_review(count)` | Closed trades waiting for a lesson, with a guide to writing one |
+| `save_lesson(ticket, lesson, usefulness_score, category, pattern_name, should_save)` | Saves the lesson into the bot's memory (or skips it) |
 
 ## Connect your app
 
@@ -103,6 +127,7 @@ ChatGPT connects only to a **remote HTTPS** MCP server, and its authentication o
 - "Use forex-bot: show my account status."
 - "Analyse EURUSD and GBPUSD, check the news and the ML probability, then preview the better trade."
 - "Place it if every check passes. Reason: H1 trend continuation." (dry run unless live mode is on)
+- "Review my closed trades and save the lessons worth keeping."
 
 ## Autonomous bot vs MCP
 - **`bot.py`** trades on its own every candle with its 5-agent LLM desk. It needs an LLM API key, or a local model through Ollama.

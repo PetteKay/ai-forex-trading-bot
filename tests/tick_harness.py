@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import types
+import zlib
 from collections import Counter
 from unittest import mock
 
@@ -146,7 +147,7 @@ def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None,
         mock.patch.object(mb, "get_account_login", side_effect=_mt5(lambda: "12345"), create=True),
         mock.patch.object(mb, "get_all_open_positions", side_effect=_mt5(lambda *a: list(open_positions))),
         mock.patch.object(mb, "get_candles", side_effect=_mt5(
-            lambda s, tf, count=200, **k: _bars(count, "h" if tf != "H4" else "4h", abs(hash(s)) % 1000))),
+            lambda s, tf, count=200, **k: _bars(count, "h" if tf != "H4" else "4h", zlib.crc32(s.encode()) % 1000))),
         mock.patch.object(mb, "get_live_price", side_effect=_mt5(lambda s: None)),
         mock.patch.object(mb, "get_spread_pips", side_effect=_mt5(lambda s: 1.0)),
         mock.patch.object(mb, "get_risk_usd", side_effect=_mt5(lambda *a, **k: 10.0)),

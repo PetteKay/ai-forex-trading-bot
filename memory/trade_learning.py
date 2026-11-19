@@ -124,13 +124,13 @@ def lesson_fields(entry_context: dict, r_multiple: float, entry_time) -> dict:
 
 
 def loss_streak(journal, symbol: str, lookback: int = 50) -> int:
-    """Consecutive losing closed trades on `symbol`, most recent first (from the journal)."""
+    """Consecutive non-winning closed trades on `symbol`, most recent first (from the
+    journal) — the same count bot.py keeps in memory (any trade with net P&L > 0 resets it)."""
     streak = 0
     for row in journal.get_recent_trades(lookback):
         if row.get("symbol") != symbol or row.get("status") != "CLOSED":
             continue
-        if (row.get("pnl") or 0) < 0:
-            streak += 1
-        else:
+        if (row.get("pnl") or 0) > 0:      # bot.py: is_win = net_pnl > 0
             break
+        streak += 1
     return streak

@@ -101,3 +101,23 @@ class TestEntrySnapshot(unittest.TestCase):
         self.assertAlmostEqual(ml[0]["r_multiple"], -0.5)   # risk_usd restored (10)
         self.assertEqual(_rows(r1["workdir"], config.MEMORY_DB_PATH,
                                "SELECT * FROM open_trade_context"), [])
+
+
+class TestLossStreakMatchesBot(unittest.TestCase):
+    """loss_streak (used by the MCP server) counts exactly like bot.py's in-memory streak."""
+
+    def test_breakeven_counts_and_a_win_resets(self):
+        from memory.trade_learning import loss_streak
+
+        class J:
+            def __init__(self, pnls):     # most recent first
+                self.rows = [{"symbol": "EURUSD", "status": "CLOSED", "pnl": p} for p in pnls]
+
+            def get_recent_trades(self, n):
+                return self.rows[:n]
+        self.assertEqual(loss_streak(J([-5, 0.0, -2, 7, -9]), "EURUSD"), 3)
+        self.assertEqual(loss_streak(J([3, -5, -5]), "EURUSD"), 0)
+        bot_streak = 0
+        for p in reversed([-5, 0.0, -2, 7, -9]):      # bot.py: is_win = net_pnl > 0
+            bot_streak = 0 if p > 0 else bot_streak + 1
+        self.assertEqual(bot_streak, 3)
