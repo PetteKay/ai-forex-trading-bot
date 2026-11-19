@@ -9,6 +9,7 @@ Results are cached for CACHE_TICKS ticks so we don't hit SQLite every tick.
 """
 
 import sqlite3
+from sqlite_conn import connect as _sqlite_connect
 import logging
 from collections import defaultdict
 from datetime import datetime
@@ -35,7 +36,7 @@ def _session_from_time(entry_time: str) -> str:
 
 def _load_trades(db_path: str) -> list[dict]:
     try:
-        with sqlite3.connect(db_path) as con:
+        with _sqlite_connect(db_path) as con:
             con.row_factory = sqlite3.Row
             rows = con.execute("""
                 SELECT symbol, direction, regime, confidence, outcome, pnl, entry_time

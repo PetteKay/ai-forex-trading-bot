@@ -67,8 +67,6 @@ def fetch_headlines(symbol: str, max_headlines: int = 8) -> list[str]:
 
     Returns an empty list on total feed failure so the bot continues normally.
     """
-    global _cache_ts, _cache_headlines
-
     now = datetime.now(timezone.utc)
     if _cache_ts and (now - _cache_ts) < _CACHE_TTL:
         return _rank_for_symbol(_cache_headlines, symbol, max_headlines)

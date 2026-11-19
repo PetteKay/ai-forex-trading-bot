@@ -8,10 +8,9 @@ Reads from observability/trade_journal.db (WAL mode — safe while bot runs).
 """
 
 import sqlite3
+from contextlib import contextmanager
+from sqlite_conn import connect as _sqlite_connect
 import os
-import sys
-import json
-from datetime import datetime, timezone
 
 from flask import Flask, jsonify, render_template
 
@@ -22,10 +21,11 @@ _DB_PATH = os.path.join(_ROOT, "observability", "trade_journal.db")
 app = Flask(__name__, template_folder="templates")
 
 
-def _db() -> sqlite3.Connection:
-    con = sqlite3.connect(_DB_PATH)
-    con.row_factory = sqlite3.Row
-    return con
+@contextmanager
+def _db():
+    with _sqlite_connect(_DB_PATH) as con:     # closed when the block ends
+        con.row_factory = sqlite3.Row
+        yield con
 
 
 def _safe_query(sql: str, params: tuple = ()) -> list[dict]:
@@ -68,7 +68,6 @@ def api_stats():
     last_eq = _safe_scalar("SELECT equity FROM equity_log ORDER BY timestamp DESC LIMIT 1", default=0.0)
     last_tick = _safe_scalar("SELECT timestamp FROM ticks ORDER BY timestamp DESC LIMIT 1", default="—")
     win_rate = round(wins / total * 100, 1) if total else 0.0
-    avg_r   = _safe_scalar("SELECT AVG(pnl / NULLIF(sl - entry_price, 0)) FROM trades WHERE status='CLOSED'", default=0.0)
 
     return jsonify({
         "total_trades":  total,

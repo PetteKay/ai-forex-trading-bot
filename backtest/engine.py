@@ -335,8 +335,6 @@ class BacktestEngine:
         print(f"  Avg R-multiple:  {results.avg_r_multiple:.2f}R")
         print(f"  Expectancy:      {results.expectancy:.2f}")
         if results.n_trades > 0:
-            wins  = [t for t in results.trades if t.pnl > 0]
-            loses = [t for t in results.trades if t.pnl <= 0]
             tp_exits = sum(1 for t in results.trades if t.exit_reason == "TP")
             sl_exits = sum(1 for t in results.trades if t.exit_reason == "SL")
             print(f"  TP exits:        {tp_exits} | SL exits: {sl_exits}")

@@ -504,3 +504,8 @@ MCP_TRADING_MODE       = "dry_run"
 # Trading over the HTTP transport (ChatGPT via a public HTTPS tunnel) is off
 # unless you set this to True. Read-only tools still work.
 MCP_HTTP_ALLOW_TRADING = False
+# Lessons from trades closed over MCP (same selectivity as bot.py's reflection):
+#   "client"  the connected AI writes them: get_trades_to_review → save_lesson
+#             (no LLM key needed)
+#   "llm"     the bot's own reflection agent writes them (needs LLM_API_KEY)
+MCP_LESSONS            = "client"

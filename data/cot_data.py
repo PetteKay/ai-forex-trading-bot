@@ -17,7 +17,7 @@ import csv
 import io
 import logging
 import os
-import sqlite3
+from sqlite_conn import connect as _sqlite_connect
 import time
 from urllib.request import urlopen, Request
 from urllib.error import URLError
@@ -46,7 +46,7 @@ _cache: dict[str, dict] = {}
 
 def _init_db(db_path: str) -> None:
     os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
-    with sqlite3.connect(db_path) as con:
+    with _sqlite_connect(db_path) as con:
         con.execute("PRAGMA journal_mode=WAL")
         con.execute("""
             CREATE TABLE IF NOT EXISTS cot_weekly (
@@ -90,7 +90,7 @@ def _fetch_and_store(db_path: str) -> dict[str, dict]:
         if not data:
             log.warning("COT: 0 rows parsed — CFTC format may have changed")
             return {}
-        with sqlite3.connect(db_path) as con:
+        with _sqlite_connect(db_path) as con:
             for sym, d in data.items():
                 con.execute("""
                     INSERT OR REPLACE INTO cot_weekly (symbol, report_date, net_long, longs, shorts)
@@ -109,7 +109,7 @@ def _fetch_and_store(db_path: str) -> dict[str, dict]:
 def _load_from_db(db_path: str) -> dict[str, dict]:
     result: dict[str, dict] = {}
     try:
-        with sqlite3.connect(db_path) as con:
+        with _sqlite_connect(db_path) as con:
             rows = con.execute("""
                 SELECT symbol, report_date, net_long, longs, shorts
                 FROM cot_weekly c
@@ -126,7 +126,7 @@ def _load_from_db(db_path: str) -> dict[str, dict]:
 
 def _compute_zscore(symbol: str, current_net: int, db_path: str, weeks: int = 26) -> float:
     try:
-        with sqlite3.connect(db_path) as con:
+        with _sqlite_connect(db_path) as con:
             rows = con.execute("""
                 SELECT net_long FROM cot_weekly WHERE symbol=?
                 ORDER BY report_date DESC LIMIT ?

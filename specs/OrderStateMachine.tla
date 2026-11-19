@@ -86,6 +86,8 @@ GovernorReject ==
     /\ order_state' = "REJECTED"
     /\ UNCHANGED <<signal_price, entry_price, exit_price, sl_price, tp_price, direction>>
 
+ABS(x) == IF x >= 0 THEN x ELSE -x
+
 \* Broker fills the order (with possible slippage)
 BrokerFill(fill_price) ==
     /\ order_state  = "APPROVED"
@@ -94,8 +96,6 @@ BrokerFill(fill_price) ==
     /\ order_state'  = "OPEN"
     /\ entry_price'  = fill_price
     /\ UNCHANGED <<signal_price, exit_price, sl_price, tp_price, direction>>
-
-ABS(x) == IF x >= 0 THEN x ELSE -x
 
 \* Position closes (TP, SL, or manual)
 ClosePosition(close_price) ==

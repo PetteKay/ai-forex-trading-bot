@@ -16,7 +16,7 @@ Cached in SQLite, refreshed every hour.
 import json
 import logging
 import os
-import sqlite3
+from sqlite_conn import connect as _sqlite_connect
 import time
 from datetime import datetime, timedelta, timezone
 from urllib.request import urlopen, Request
@@ -50,7 +50,7 @@ _TITLE_TO_CCY: dict[str, str] = {
 
 def _init_db(db_path: str) -> None:
     os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
-    with sqlite3.connect(db_path) as con:
+    with _sqlite_connect(db_path) as con:
         con.execute("PRAGMA journal_mode=WAL")
         con.execute("""
             CREATE TABLE IF NOT EXISTS econ_surprises (
@@ -103,7 +103,7 @@ def _fetch_and_store(db_path: str) -> None:
         events = json.loads(resp.read().decode("utf-8", errors="replace"))
         now_s  = datetime.now(timezone.utc).isoformat()
         stored = 0
-        with sqlite3.connect(db_path) as con:
+        with _sqlite_connect(db_path) as con:
             for ev in events:
                 if ev.get("impact", "").lower() not in ("high", "3"):
                     continue
@@ -160,7 +160,7 @@ def get_surprise_score(
     cutoff = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     ccy    = currency.upper()
     try:
-        with sqlite3.connect(db_path) as con:
+        with _sqlite_connect(db_path) as con:
             rows = con.execute("""
                 SELECT surprise FROM econ_surprises
                 WHERE currency=? AND event_date>=? AND surprise IS NOT NULL

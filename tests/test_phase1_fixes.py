@@ -17,10 +17,28 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 logging.disable(logging.CRITICAL)
 
-import numpy as np    # noqa: E402  (imported up-front: numpy cannot be re-imported)
-import pandas as pd   # noqa: E402,F401
+import numpy as np  # noqa: E402  (imported up-front: numpy cannot be re-imported)
+import importlib    # noqa: E402
+importlib.import_module("pandas")   # load once, before any module juggling
 
 from risk_governor import RiskGovernor  # noqa: E402
+
+
+import contextlib  # noqa: E402
+
+
+@contextlib.contextmanager
+def _module_replaced(name, value):
+    """Replace one sys.modules entry and restore only that entry afterwards."""
+    had, old = name in sys.modules, sys.modules.get(name)
+    sys.modules[name] = value
+    try:
+        yield
+    finally:
+        if had:
+            sys.modules[name] = old
+        else:
+            sys.modules.pop(name, None)
 
 
 def _install_fake_mt5(test, fake):
@@ -51,6 +69,11 @@ def _gov(equity, path):
 # ─────────────────────────────────────────────────────────────────────────────
 # Bug 1: a restart (manual or crash auto-restart) erased the safety stops
 # ─────────────────────────────────────────────────────────────────────────────
+def _read(path):
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
 class TestGovernorSurvivesRestart(unittest.TestCase):
     def setUp(self):
         self.dir  = tempfile.mkdtemp()
@@ -155,8 +178,8 @@ class TestKillSwitchKeepsRecordsForPnL(unittest.TestCase):
                          "close_all removed the records, so their P&L could never be booked")
 
     def test_closed_trade_detection_runs_before_kill_guard(self):
-        src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                "bot.py")).read()
+        src = _read(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "bot.py"))
         detect = src.index("# ── 3. Detect closed trades")
         guard  = src.index("# ── Kill-switch guard")
         self.assertLess(detect, guard,
@@ -313,8 +336,7 @@ class TestEveryClosedTradeIsTrainingData(unittest.TestCase):
         store.save_ml_sample({**tr, "ticket": 1})                  # idempotent
         lesson = {**tr, "entry_price": 1.0, "exit_price": 1.1, "fingerprint": "x",
                   "lesson": "test", "usefulness_score": 0.9, "ml_sampled": 1}
-        from unittest import mock
-        with mock.patch.dict(sys.modules, {"memory.semantic": None}):
+        with _module_replaced("memory.semantic", None):
             self.assertTrue(store.save(lesson))
         self.assertEqual(len(store.get_all_for_training()), 1)
 
@@ -325,8 +347,7 @@ class TestEveryClosedTradeIsTrainingData(unittest.TestCase):
         tr = _fake_trades(1)[0]
         lesson = {**tr, "entry_price": 1.0, "exit_price": 1.1, "fingerprint": "x",
                   "lesson": "old", "usefulness_score": 0.9}         # pre-fix: ml_sampled 0
-        from unittest import mock
-        with mock.patch.dict(sys.modules, {"memory.semantic": None}):
+        with _module_replaced("memory.semantic", None):
             store.save(lesson)
         self.assertEqual(len(store.get_all_for_training()), 1)
 
@@ -387,8 +408,8 @@ class TestPositionSizing(unittest.TestCase):
         self.assertGreater(kelly_fraction(0.60, 1.67, 0.25), 0.0)
 
     def test_bot_skips_trade_when_kelly_has_no_edge(self):
-        src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                "bot.py")).read()
+        src = _read(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "bot.py"))
         self.assertNotIn("if frac_k > 0 else size_mult", src,
                          "Zero-edge Kelly must not fall back to full size")
         i = src.index("if frac_k <= 0:")
@@ -431,9 +452,9 @@ class TestAdoptedPositionOpenTime(unittest.TestCase):
         self.assertIsNone(b.terminal_time_to_utc(1_763_000_000, "EURUSD", now))
 
     def test_bot_uses_position_open_time(self):
-        src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                "bot.py")).read()
-        self.assertIn('entry_time    = _opened or datetime.now(UTC)', src)
+        src = _read(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "bot.py"))
+        self.assertIn('entry_time    = _snap_time or _opened or datetime.now(UTC)', src)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -34,7 +34,9 @@ from datetime import datetime, UTC
 from strategy.position_sizing import compute_lot, kelly_fraction
 from agents.desk import run_desk
 from strategy.bar_gate import BarGate
-from strategy.correlation import _CORR_GROUPS, _check_correlation  # noqa: F401
+from memory.trade_learning import (classify_outcome, update_blacklist, save_training_sample,
+                                   lesson_fields, json_safe_context)
+from strategy.correlation import _check_correlation
 
 # Fix Windows console encoding so Unicode box-drawing chars don't crash the logger
 if hasattr(sys.stdout, "reconfigure"):
@@ -44,6 +46,8 @@ if hasattr(sys.stderr, "reconfigure"):
 
 import config
 import mt5_bridge as mt5b
+import bot_control
+from trade_booking import book_closed_trades
 from risk_governor import RiskGovernor
 from memory.store import TradeMemoryStore
 from strategy.indicators import compute, market_fingerprint, feature_vector
@@ -67,7 +71,7 @@ _DESK_AGENTS = {
 }
 from data.news_feed import fetch_headlines
 try:
-    from data.macro_context import get_macro_context, macro_summary_for_llm
+    from data.macro_context import get_macro_context
     _MACRO_AVAILABLE = True
 except ImportError:
     _MACRO_AVAILABLE = False
@@ -157,14 +161,15 @@ from notifications.telegram_alert import TelegramAlert
 from concurrent.futures import ThreadPoolExecutor
 
 # ── Logging ──────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("bot.log", encoding="utf-8"),
-    ],
-)
+if not logging.getLogger().handlers:      # once per process (bot.log isn't reopened)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler("bot.log", encoding="utf-8"),
+        ],
+    )
 log = logging.getLogger("Bot")
 
 
@@ -190,18 +195,16 @@ class OpenTradeRecord:
         self.volume        = volume
 
 
-# ── Outcome classification (R-multiple, account-size invariant) ──────────────
-# R = net_pnl / initial_risk_usd.  1.0R = made back exactly what we risked.
-def classify_outcome(r_multiple: float) -> str:
-    if r_multiple >= 1.5:   return "WIN_STRONG"   # 150%+ of risk recovered
-    if r_multiple >= 0.3:   return "WIN"           # at least 30% of risk recovered
-    if r_multiple >= -0.15: return "BREAKEVEN"     # flat within spread/commission
-    if r_multiple >= -0.8:  return "LOSS"          # partial loss
-    return "STOP_LOSS"                             # full or near-full stop hit
-
-
 # ── Main ─────────────────────────────────────────────────────────────────────
-def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
+def run(demo_mode: bool = False, reset_drawdown_halt: bool = False, control=None):
+    """control: bot_control.BotSide (pause / stop / close / retrain from an MCP
+    client, specs/BotControl.tla). None = no control file (tests, backtests)."""
+    global _CONTROL_HOOK
+    control = control or bot_control.NullControl()
+    # Limits an MCP client tightened (never looser than config.py)
+    _overrides = bot_control.apply_overrides(config)
+    if _overrides:
+        log.warning(f"Settings tightened from MCP (observability/settings_overrides.json): {_overrides}")
     # Build watch list — use SYMBOLS if set, else fall back to single SYMBOL
     symbols_config = getattr(config, "SYMBOLS", None) or [config.SYMBOL]
 
@@ -331,6 +334,41 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
     open_trades: dict[int, OpenTradeRecord] = {}
     tick_count = 0
 
+    # ── Control from MCP clients (bot_control.py, specs/BotControl.tla) ──────
+    # Called only on this main thread, never while an order is being sent, so a
+    # pause this bot has confirmed means nothing of its is in flight (INV-BC-5).
+    def _handle_control() -> dict:
+        cmd = control.poll()
+        for _t in cmd["close"]:                                   # [BotClose]
+            try:
+                _p = next((p for p in mt5b.get_all_open_positions(config.MAGIC_NUMBER)
+                           if p["ticket"] == _t), None)
+                if _p is None:
+                    control.report_close(_t, "not open")          # [BotDropClose]
+                else:
+                    # Done in demo mode too: it is your explicit request (the MCP
+                    # server only sends it in live mode), and while this bot holds
+                    # the account nothing else may close the position.
+                    _ok = mt5b.close_position(_t, _p["symbol"], _p["volume"], _p["type"],
+                                              magic=config.MAGIC_NUMBER)
+                    control.report_close(_t, "closed" if _ok else "failed")
+                    log.warning(f"Closed {_t} on request from an MCP client: {_ok}")
+            except Exception as _ce:
+                control.report_close(_t, f"failed: {_ce}")
+        if cmd["retrain"]:
+            try:
+                _ok = meta_gate.train(memory.get_all_for_training(),
+                                      training_lookback_days=getattr(config, "ML_TRAINING_LOOKBACK_DAYS", 180))
+                _res = {"trained": bool(_ok), "n_samples": getattr(meta_gate, "_n_samples", 0),
+                        "at": datetime.now(UTC).isoformat(timespec="seconds")}
+            except Exception as _re:
+                _res = {"trained": False, "error": str(_re)}
+            control.report_retrain(cmd["retrain"], _res)
+            log.info(f"ML gate retrained on request from an MCP client: {_res}")
+        return cmd
+    _CONTROL_HOOK = lambda: _handle_control()["stop"]   # noqa: E731  (polled in _sleep)
+    control.update(account=str(mt5b.get_account_login() or ""), state="running")
+
     # Reconcile any positions that were open when the bot last stopped
     _existing = mt5b.get_all_open_positions(config.MAGIC_NUMBER)
     for _pos in _existing:
@@ -345,20 +383,32 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
             log.warning(f"[{_pos['symbol']}] ticket {_ticket}: open time unavailable "
                         f"(market closed?) — using now; max-hold clock restarts.")
         if _ticket not in open_trades:
+            # Entry snapshot saved when the trade was opened (by bot.py or the MCP
+            # server): restores the context the lesson and ML sample need.
+            try:
+                _snap = memory.get_open_context(_ticket) or {}
+            except Exception:
+                _snap = {}
+            _snap_time = None
+            if _snap.get("entry_time"):
+                try:
+                    _snap_time = datetime.fromisoformat(_snap["entry_time"])
+                except Exception:
+                    _snap_time = None
             open_trades[_ticket] = OpenTradeRecord(
                 ticket        = _ticket,
                 symbol        = _pos["symbol"],
                 direction     = _pos["type"],
                 entry_price   = _pos["price"],
-                entry_context = {},
-                tech_analysis = {},
-                pm_decision   = {},
-                entry_time    = _opened or datetime.now(UTC),
-                atr           = 0.0,
+                entry_context = _snap.get("context", {}),
+                tech_analysis = _snap.get("tech", {}),
+                pm_decision   = _snap.get("pm", {}),
+                entry_time    = _snap_time or _opened or datetime.now(UTC),
+                atr           = float((_snap.get("context") or {}).get("atr", 0.0) or 0.0),
                 sl            = _pos["sl"],
                 tp            = _pos["tp"],
                 volume        = _pos["volume"],
-                risk_usd      = 0.0,
+                risk_usd      = float(_snap.get("risk_usd") or 0.0),
             )
     if _existing:
         log.info(f"Startup reconciliation: adopted {len(_existing)} orphaned position(s) from MT5.")
@@ -368,7 +418,13 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
     try:
         while True:
             tick_start = datetime.now(UTC)
+            _cmd = _handle_control()
+            if _cmd["stop"]:                                      # [GracefulStop]
+                log.warning("Stop requested from an MCP client — shutting down.")
+                return
+            _paused = _cmd["paused"]
             tick_count += 1
+            control.update(tick=tick_count, last_tick=tick_start.isoformat(timespec="seconds"))
             log.info(f"\n{'─'*60}")
             log.info(f"Tick #{tick_count}: {tick_start.strftime('%Y-%m-%d %H:%M:%S UTC')}")
 
@@ -474,19 +530,10 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                 if is_win:
                     _win_streak[sym]  = _win_streak.get(sym, 0) + 1
                     _loss_streak[sym] = 0
-                    if getattr(config, "SETUP_BLACKLIST_ENABLED", False):
-                        journal.reset_blacklist(sym, _regime_at_entry)
                 else:
                     _loss_streak[sym] = _loss_streak.get(sym, 0) + 1
                     _win_streak[sym]  = 0
-                    if getattr(config, "SETUP_BLACKLIST_ENABLED", False):
-                        _bl_count = journal.add_blacklist_loss(sym, _regime_at_entry)
-                        _bl_thresh = getattr(config, "SETUP_BLACKLIST_THRESHOLD", 3)
-                        if _bl_count >= _bl_thresh:
-                            log.warning(
-                                f"[{sym}] BLACKLISTED: {_bl_count} consecutive losses "
-                                f"in {_regime_at_entry} regime — will skip next occurrence."
-                            )
+                update_blacklist(journal, config, sym, _regime_at_entry, is_win)
                 _cur_streak = _loss_streak.get(sym, 0)
                 if _cur_streak >= getattr(config, "LOSS_STREAK_THRESHOLD", 3):
                     log.warning(
@@ -526,65 +573,26 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                     pm_decision        = record.pm_decision,
                     cfg                = config,
                 )
-                _rc_entry = record.entry_context.get("regime", {})
-                _regime_entry = _rc_entry.get("regime", "") if isinstance(_rc_entry, dict) else ""
-                _entry_iso = (record.entry_time.isoformat()
-                              if hasattr(record.entry_time, "isoformat") else str(record.entry_time))
-                _exit_iso  = datetime.now(UTC).isoformat()
-
                 if lesson_record:
-                    lesson_record["feature_vector"] = feature_vector(record.entry_context)
-                    lesson_record["r_multiple"]     = r_multiple
-                    lesson_record["regime"]         = _regime_entry
-                    # Store Tier 1 signal context for ML training
-                    lesson_record["fib_proximity"] = record.entry_context.get("fib_proximity", 0.0)
-                    lesson_record["cot_z_score"]   = record.entry_context.get("cot_z_score", 0.0)
-                    lesson_record["econ_surprise"]  = record.entry_context.get("econ_surprise", 0.0)
-                    lesson_record["entry_time"]     = _entry_iso
-                    # This trade's training row lives in ml_samples (below), so the
-                    # memory copy is excluded from training to avoid counting it twice.
-                    lesson_record["ml_sampled"]     = 1 if record.entry_context else 0
+                    lesson_record.update(lesson_fields(record.entry_context, r_multiple,
+                                                       record.entry_time))
                     saved = memory.save(lesson_record)
                     if saved:
                         log.info(f"★ [{sym}] Lesson saved: {lesson_record['lesson'][:100]}")
 
+                try:
+                    memory.delete_open_context(ticket)
+                except Exception:
+                    pass
+
                 # ── ML training data: EVERY closed trade, not only saved lessons ──
-                # Training only on lessons the reflection LLM chose to keep (and that
-                # survived usefulness pruning) biased the meta-label model's data.
-                # Adopted positions (no entry context) have no features to learn from.
-                if record.entry_context:
-                    try:
-                        memory.save_ml_sample({
-                            "ticket":         ticket,
-                            "symbol":         sym,
-                            "direction":      record.direction,
-                            "entry_time":     _entry_iso,
-                            "exit_time":      _exit_iso,
-                            "feature_vector": feature_vector(record.entry_context),
-                            "regime":         _regime_entry,
-                            "fib_proximity":  record.entry_context.get("fib_proximity", 0.0),
-                            "cot_z_score":    record.entry_context.get("cot_z_score", 0.0),
-                            "econ_surprise":  record.entry_context.get("econ_surprise", 0.0),
-                            "r_multiple":     r_multiple,
-                            "pnl_pct":        pnl_pct,
-                            "outcome":        outcome,
-                        })
-                    except Exception as _ms_err:
-                        log.warning(f"[{sym}] Could not store ML sample: {_ms_err}")
-                    # SGD online update — immediate single-trade adaptation
-                    try:
-                        meta_gate.online_update(
-                            feature_vector = feature_vector(record.entry_context),
-                            is_win         = net_pnl > 0,
-                            regime_str     = _regime_entry,
-                            fib_proximity  = record.entry_context.get("fib_proximity", 0.0),
-                            cot_z_score    = record.entry_context.get("cot_z_score", 0.0),
-                            econ_surprise  = record.entry_context.get("econ_surprise", 0.0),
-                            direction      = record.direction,
-                            entry_time     = record.entry_time,
-                        )
-                    except Exception as _ol_err:
-                        log.debug(f"Online update error: {_ol_err}")
+                # (memory/trade_learning.py — shared with the MCP server)
+                if save_training_sample(
+                        memory, meta_gate, ticket=ticket, symbol=sym,
+                        direction=record.direction, entry_time=record.entry_time,
+                        exit_time=datetime.now(UTC), entry_context=record.entry_context,
+                        r_multiple=r_multiple, pnl_pct=pnl_pct, outcome=outcome,
+                        is_win=net_pnl > 0):
                     memories_since_retrain += 1
                     if memories_since_retrain >= config.META_RETRAIN_EVERY:
                         all_m = memory.get_all_for_training()
@@ -604,6 +612,21 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                                 _dynamic_min_confidence = _new_conf
                             else:
                                 log.debug(f"AdaptiveConf: {_conf_reason}")
+
+            # ── 3b. Trades that closed while no bot was running ───────────
+            # (opened by an earlier run or over MCP, closed by SL/TP meanwhile).
+            # This bot holds the account lock, so it is the only booker (INV-BC-3).
+            try:
+                for _b in book_closed_trades(
+                        journal=journal, memory=memory, governor=governor, meta_gate=meta_gate,
+                        mt5b=mt5b, magic=config.MAGIC_NUMBER, cfg=config,
+                        exclude=open_trades.keys(), telegram=_tg, llm_state={"llm_ready": True}):
+                    memories_since_retrain += int(bool(_b["ml_sample"]))
+                    _daily_stats["trades"] += 1
+                    _daily_stats["total_pnl"] += _b["net_pnl"]
+                    _daily_stats["winners"] += int(_b["net_pnl"] > 0)
+            except Exception as _ob_err:
+                log.warning(f"Booking trades closed while the bot was off failed: {_ob_err}")
 
             # ── Kill-switch guard ─────────────────────────────────────────
             gov_status = governor.status
@@ -662,6 +685,7 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                 "spread": 0, "calendar": 0, "hold": 0, "confidence": 0,
                 "timing": 0, "risk_veto": 0, "ml_gate": 0, "bear_veto": 0,
                 "duplicate": 0, "correlation": 0, "governor": 0, "placed": 0,
+                "paused": 0,
             }
 
             # Stage 1 (main thread): data, filters, memory recall — all MT5 calls.
@@ -669,7 +693,11 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
             # Already at the position limit: no new trade is possible this tick,
             # so don't spend LLM calls on desks (positions are managed above).
             _scan_list = symbols_list
-            if open_count >= config.MAX_OPEN_POSITIONS:
+            if _paused:
+                log.info("Trading paused from an MCP client — managing open positions only.")
+                _funnel["paused"] = len(symbols_list)
+                _scan_list = []
+            elif open_count >= config.MAX_OPEN_POSITIONS:
                 log.info(f"At max open positions ({open_count}) — skipping the symbol scan.")
                 _funnel["max_positions"] = len(symbols_list)
                 _scan_list = []
@@ -1209,7 +1237,6 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                             _im = get_intermarket_bias(symbol, action, live_macro)
                             _im_adj = _im.get("confidence_adj", 0)
                             if _im_adj != 0:
-                                old_conf   = confidence
                                 confidence = max(0, min(100, confidence + _im_adj))
                                 pm["confidence"] = confidence
                                 log.info(
@@ -1563,6 +1590,15 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                         f"Lot={adjusted_lot} ({_lot_note})"
                     )
 
+                    # Last check before the order: a pause or stop from an MCP
+                    # client that arrived during this tick wins.     [BotBeginOrder]
+                    _last = _handle_control()
+                    if _last["paused"] or _last["stop"]:
+                        log.info(f"[{symbol}] Not placed: trading "
+                                 f"{'stopped' if _last['stop'] else 'paused'} from an MCP client.")
+                        _funnel["paused"] += 1
+                        continue
+
                     if demo_mode:
                         log.info(f"[DEMO] Would {action} {adjusted_lot} {symbol}")
                     else:
@@ -1596,6 +1632,17 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                                 volume        = adjusted_lot,
                                 risk_usd      = risk_usd,
                             )
+                            # Entry snapshot in the DB: survives restarts, and lets the
+                            # MCP server learn from this trade too if it books the close.
+                            try:
+                                memory.save_open_context(
+                                    result["ticket"], symbol=symbol, direction=action,
+                                    entry_time=open_trades[result["ticket"]].entry_time.isoformat(),
+                                    entry_price=result["price"], risk_usd=risk_usd,
+                                    context=json_safe_context(ctx), tech=tech, pm=pm,
+                                    source="bot", reason=pm.get("reasoning", ""))
+                            except Exception as _oc_err:
+                                log.warning(f"[{symbol}] Could not store entry snapshot: {_oc_err}")
                             journal.log_trade_open(
                                 ticket          = result["ticket"],
                                 symbol          = symbol,
@@ -1675,6 +1722,7 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
     except KeyboardInterrupt:
         log.info("Stopped by user (Ctrl+C).")
     finally:
+        _CONTROL_HOOK = None
         mt5b.disconnect()
         journal.print_summary()
         try:
@@ -1713,11 +1761,26 @@ def _ctx_to_query(ctx: dict, regime_info: dict) -> str:
     return " | ".join(p for p in parts if p.split()[-1])
 
 
+_CONTROL_HOOK = None   # set by run(): reads the control file, True = stop requested
+_CONTROL_POLL_S = 2.0
+
+
 def _sleep(tick_start: datetime):
     elapsed = (datetime.now(UTC) - tick_start).total_seconds()
     sleep_s = max(5, config.CHECK_INTERVAL_SECONDS - elapsed)
     log.info(f"Next tick in {sleep_s:.0f}s")
-    time.sleep(sleep_s)
+    end = time.monotonic() + sleep_s
+    while True:
+        left = end - time.monotonic()
+        if left <= 0:
+            return
+        time.sleep(min(_CONTROL_POLL_S, left))
+        if _CONTROL_HOOK is not None:          # pause / stop / close / retrain requests
+            try:
+                if _CONTROL_HOOK():
+                    return
+            except Exception as e:
+                log.debug(f"Control poll failed: {e}")
 
 
 if __name__ == "__main__":
@@ -1728,20 +1791,32 @@ if __name__ == "__main__":
     args = parser.parse_args()
     _reset_halt_once = args.reset_drawdown_halt
 
+    # One bot.py per account: the account lock (bot_control.py, INV-BC-1/2).
+    # Held for the life of this process — the OS frees it if the process dies.
+    _control = bot_control.BotSide(mode="demo" if args.demo else "live")
+    _ok, _why = _control.acquire()
+    if not _ok:
+        log.error(f"Not starting: {_why}.")
+        sys.exit(2)
+    log.info(f"Bot instance {_control.instance} (pid {os.getpid()}) holds the account lock.")
+
     # Supervisor: if the main loop dies on an unhandled error, restart instead of
     # exiting silently. Open positions are re-adopted by startup reconciliation.
     _RESTART_DELAY_S = 60
-    while True:
-        try:
-            _reset_now, _reset_halt_once = _reset_halt_once, False   # never on auto-restart
-            run(demo_mode=args.demo, reset_drawdown_halt=_reset_now)
-            break  # clean exit (Ctrl+C is handled inside run())
-        except KeyboardInterrupt:
-            break
-        except Exception:
-            log.critical(
-                f"Bot crashed with unhandled error — restarting in {_RESTART_DELAY_S}s "
-                f"(open positions will be re-adopted on restart)",
-                exc_info=True,
-            )
-            time.sleep(_RESTART_DELAY_S)
+    try:
+        while True:
+            try:
+                _reset_now, _reset_halt_once = _reset_halt_once, False   # never on auto-restart
+                run(demo_mode=args.demo, reset_drawdown_halt=_reset_now, control=_control)
+                break  # clean exit: Ctrl+C or a stop request (both handled inside run())
+            except KeyboardInterrupt:
+                break
+            except Exception:
+                log.critical(
+                    f"Bot crashed with unhandled error — restarting in {_RESTART_DELAY_S}s "
+                    f"(open positions will be re-adopted on restart)",
+                    exc_info=True,
+                )
+                time.sleep(_RESTART_DELAY_S)
+    finally:
+        _control.release()

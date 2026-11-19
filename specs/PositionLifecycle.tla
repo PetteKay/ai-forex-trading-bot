@@ -67,7 +67,11 @@ MoveToBreakeven ==
     /\ ~breakeven_applied
     /\ direction = 1 => current_price > entry_price + 10
     /\ direction = -1 => current_price < entry_price - 10
-    /\ sl'              = entry_price
+    \* Only if break-even is tighter than the current SL (a trailed SL can
+    \* already be past entry). position_manager.py: needs_move / _tightens.
+    /\ sl' = IF \/ (direction = 1  /\ entry_price > sl)
+                \/ (direction = -1 /\ (sl = 0 \/ entry_price < sl))
+             THEN entry_price ELSE sl
     /\ breakeven_applied' = TRUE
     /\ UNCHANGED <<status, direction, entry_price, current_price, tp, volume>>
 
@@ -95,7 +99,13 @@ FullClose ==
     /\ volume'  = 0
     /\ UNCHANGED <<direction, entry_price, current_price, sl, tp, breakeven_applied>>
 
+\* A closed position stays closed (terminal state, not a deadlock)
+Closed ==
+    /\ status = "CLOSED"
+    /\ UNCHANGED vars
+
 Next ==
+    \/ Closed
     \/ \E p \in 1..MaxPrice : PriceMove(p)
     \/ MoveToBreakeven
     \/ \E s \in 1..MaxPrice : TrailSL(s)
@@ -122,6 +132,12 @@ INV_BreakevenCorrect ==
 \* INV-PL-5: While OPEN, volume must be >= 1
 INV_VolumePositiveWhileOpen ==
     status = "OPEN" => volume >= 1
+
+\* INV-PL-1 as a real check (action property): a BUY's SL never moves down,
+\* a SELL's never moves up, once set.
+INV_PL1_SLNeverWidens ==
+    [][ /\ (direction = 1 /\ sl > 0) => sl' >= sl
+        /\ (direction = -1 /\ sl > 0) => (sl' <= sl /\ sl' > 0) ]_vars
 
 Safety ==
     /\ TypeOK

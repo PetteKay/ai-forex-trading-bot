@@ -358,8 +358,8 @@ def get_closed_trade(ticket: int, max_wait_secs: float = 5.0) -> dict | None:
         "swap":        total_swap,
         "commission":  total_comm,
         "net_pnl":     total_pnl + total_swap + total_comm,
-        "entry_time":  datetime.utcfromtimestamp(entry_deal.time),
-        "exit_time":   datetime.utcfromtimestamp(exit_deal.time),
+        "entry_time":  datetime.fromtimestamp(entry_deal.time, timezone.utc).replace(tzinfo=None),
+        "exit_time":   datetime.fromtimestamp(exit_deal.time, timezone.utc).replace(tzinfo=None),
     }
 
 

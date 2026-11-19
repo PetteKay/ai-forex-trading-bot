@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import types
+import zlib
 from collections import Counter
 from unittest import mock
 
@@ -52,10 +53,17 @@ def _bars(n, freq, seed):
 
 
 def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None,
-                 ticks=1, cfg_extra=None, on_tick_end=None):
+                 ticks=1, cfg_extra=None, on_tick_end=None, reflect_result=None,
+                 close_pnl=1.0, workdir=None, start_positions=None, control=None,
+                 before_pm=None, closed_history=None, demo=False):
     """Run `ticks` loop iterations. Returns dict(tick_seconds of the first tick,
-    llm_calls, orders, threads_seen, mt5_threads, error)."""
-    workdir = tempfile.mkdtemp()
+    llm_calls, orders, threads_seen, mt5_threads, error, closes, control).
+
+    control: a factory called inside the work folder, returning the
+    bot_control.BotSide passed to bot.run(control=...).
+    before_pm(symbol): called just before each Fund Manager decision (mid-tick).
+    closed_history: {ticket: net_pnl} for get_closed_trade (default close_pnl)."""
+    workdir = workdir or tempfile.mkdtemp()
     old_cwd = os.getcwd()
     os.chdir(workdir)
     sys.modules["MetaTrader5"] = _fake_mt5_module()
@@ -89,6 +97,8 @@ def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None,
 
     def _pm(*a, **k):
         sym = k["ctx"].get("symbol") or ""
+        if before_pm:
+            before_pm(sym)
         i = symbols.index(sym) if sym in symbols else 0
         if buy_every and i % buy_every == 0:
             return {"action": "BUY", "confidence": 85, "reasoning": "harness",
@@ -110,7 +120,13 @@ def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None,
         if tick["n"] >= ticks:
             raise KeyboardInterrupt   # bot.run() treats this as a clean stop
 
-    open_positions = []      # orders stay open (never closed) in the harness
+    open_positions = list(start_positions or [])   # orders stay open until a test closes them
+    closes = []
+
+    def _close_position(ticket, symbol, volume, direction, magic=None, **k):
+        closes.append(ticket)
+        open_positions[:] = [p for p in open_positions if p["ticket"] != ticket]
+        return True
 
     def _place_order(**k):
         orders.append(k["symbol"])
@@ -145,16 +161,24 @@ def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None,
         mock.patch.object(mb, "get_account_login", side_effect=_mt5(lambda: "12345"), create=True),
         mock.patch.object(mb, "get_all_open_positions", side_effect=_mt5(lambda *a: list(open_positions))),
         mock.patch.object(mb, "get_candles", side_effect=_mt5(
-            lambda s, tf, count=200, **k: _bars(count, "h" if tf != "H4" else "4h", abs(hash(s)) % 1000))),
+            lambda s, tf, count=200, **k: _bars(count, "h" if tf != "H4" else "4h", zlib.crc32(s.encode()) % 1000))),
         mock.patch.object(mb, "get_live_price", side_effect=_mt5(lambda s: None)),
         mock.patch.object(mb, "get_spread_pips", side_effect=_mt5(lambda s: 1.0)),
         mock.patch.object(mb, "get_risk_usd", side_effect=_mt5(lambda *a, **k: 10.0)),
         mock.patch.object(mb, "place_order", side_effect=_mt5(_place_order)),
         mock.patch.object(mb, "get_closed_trade", side_effect=_mt5(lambda t, **k: {
             "ticket": t, "entry_price": 1.1, "exit_price": 1.11, "volume": 0.01, "pnl": 1.0,
-            "swap": 0.0, "commission": 0.0, "net_pnl": 1.0})),
+            "swap": 0.0, "commission": 0.0,
+            "net_pnl": (closed_history or {}).get(t, close_pnl)})),
+        mock.patch.object(mb, "close_position", side_effect=_mt5(_close_position)),
+        mock.patch.object(mb, "terminal_time_to_utc", side_effect=lambda ts, sym=None: None,
+                          create=True),
         mock.patch.object(bot.llm, "init", return_value=None),
-        mock.patch.object(bot.reflection, "reflect", return_value=None),
+        mock.patch.object(bot.reflection, "reflect", side_effect=_agent(
+            "reflection", lambda *a, **k: (dict(reflect_result, **{"symbol": k["symbol"],
+                "direction": k["direction"], "entry_price": k["entry_price"],
+                "exit_price": k["exit_price"], "pnl_pct": k["pnl_pct"], "outcome": k["outcome"],
+                "fingerprint": "fp", "market_context": {}})) if reflect_result else None)),
         mock.patch.object(bot, "_sleep", side_effect=_sleep),
         mock.patch.object(bot, "fetch_headlines", side_effect=_agent("headlines", lambda *a, **k: ["Dollar firm"])),
         mock.patch.object(bot.technical_analyst, "analyse", side_effect=_agent(
@@ -172,27 +196,38 @@ def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None,
     sem = types.ModuleType("memory.semantic")
     sem.embed_market_context = lambda *a, **k: None
     sem.embed_text = lambda *a, **k: None
-    patches.append(mock.patch.dict(sys.modules, {"memory.semantic": sem}))
+    # Replace only this one module and put it back afterwards. (mock.patch.dict on
+    # sys.modules would also unload everything imported during the run, e.g.
+    # numpy.fft, which numpy cannot load twice.)
+    _had_sem, _old_sem = "memory.semantic" in sys.modules, sys.modules.get("memory.semantic")
+    sys.modules["memory.semantic"] = sem
 
     err = None
+    ctl = None
     for p in patches:
         p.start()
     try:
+        ctl = control() if control else None
         tick["start"] = time.perf_counter()
-        bot.run(demo_mode=False)
+        bot.run(demo_mode=demo, control=ctl)
     except SystemExit as e:
         err = f"SystemExit {e}"
-    except Exception as e:  # pragma: no cover - reported to caller
+    except Exception:  # pragma: no cover - reported to caller
         import traceback
         err = traceback.format_exc()
     finally:
         for p in reversed(patches):
             p.stop()
+        if _had_sem:
+            sys.modules["memory.semantic"] = _old_sem
+        else:
+            sys.modules.pop("memory.semantic", None)
         os.chdir(old_cwd)
     end = tick["end"] or time.perf_counter()
     return {"tick_seconds": round(end - tick["start"], 2), "llm_calls": dict(calls),
             "orders": orders, "threads_seen": len(threads_seen),
-            "mt5_threads": sorted(mt5_threads), "error": err}
+            "mt5_threads": sorted(mt5_threads), "error": err, "workdir": workdir,
+            "closes": closes, "control": ctl, "ticks_run": tick.get("n", 0)}
 
 
 if __name__ == "__main__":

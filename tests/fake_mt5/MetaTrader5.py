@@ -4,6 +4,7 @@ Stateful: an account, a few symbols, synthetic H1/H4 candles, positions, and
 order_send that fills market orders. Put this folder first on PYTHONPATH.
 """
 import time as _time
+import zlib as _zlib
 from types import SimpleNamespace as _NS
 
 import numpy as _np
@@ -75,6 +76,15 @@ def symbol_info(symbol):
                visible=True, trade_mode=4)
 
 
+def order_calc_profit(action, symbol, volume, price_open, price_close):
+    """Profit of moving `volume` lots from price_open to price_close (tick-value maths)."""
+    i = symbol_info(symbol)
+    if i is None:
+        return None
+    sign = 1 if action == ORDER_TYPE_BUY else -1
+    return round(sign * (price_close - price_open) / i.trade_tick_size * i.trade_tick_value * volume, 2)
+
+
 def symbol_info_tick(symbol):
     p = _SYMBOLS.get(symbol)
     if p is None:
@@ -84,7 +94,7 @@ def symbol_info_tick(symbol):
 
 def copy_rates_from_pos(symbol, tf, start, count):
     base = _SYMBOLS.get(symbol, 1.0)
-    rng = _np.random.default_rng(abs(hash((symbol, tf))) % 2**32)
+    rng = _np.random.default_rng(_zlib.crc32(f"{symbol}|{tf}".encode()))  # same data every run
     c = base * _np.exp(_np.cumsum(rng.normal(0.0002, 0.0015, count)))
     c *= base / c[-1]
     o = _np.r_[c[0], c[:-1]]

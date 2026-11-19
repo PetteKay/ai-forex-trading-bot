@@ -41,3 +41,14 @@ skills-lock.json
 *.bak
 outputs/
 .DS_Store
+
+# TLC model-checker output
+specs/states/
+specs/*_TTrace_*
+specs/*.out
+observability/bot.lock
+observability/bot_status.json
+observability/bot_control.json*
+observability/settings_overrides.json*
+observability/jobs/
+observability/*.tmp

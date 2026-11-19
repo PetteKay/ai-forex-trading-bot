@@ -11,9 +11,7 @@ Run: py -m pytest tests/test_critical_fixes.py -v
 import sys
 import os
 import math
-import types
 import unittest
-from decimal import Decimal
 
 # ── Project root on path ─────────────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -80,9 +78,9 @@ class TestBooleanCoercion(unittest.TestCase):
 def _build_extended_features_local(fv: list, ctx: dict = None) -> list:
     """Local replica of ml/meta_label._build_extended_features for testing."""
     import math
-    from datetime import datetime
+    from datetime import datetime, timezone
     base = list(fv) if fv else [0.5] * 16
-    now      = datetime.utcnow()
+    now      = datetime.now(timezone.utc).replace(tzinfo=None)
     hour     = now.hour + now.minute / 60.0
     dow      = now.weekday()
     sin_hour = math.sin(hour * 2 * math.pi / 24)

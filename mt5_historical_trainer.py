@@ -32,12 +32,10 @@ import argparse
 import json
 import logging
 import random
-import sqlite3
+from sqlite_conn import connect as _sqlite_connect
 import sys
 from collections import defaultdict
-from datetime import datetime
 
-import numpy as np
 import pandas as pd
 
 import config
@@ -200,7 +198,7 @@ def _write_sample(db_path: str, s: dict) -> bool:
     mc      = {k: v for k, v in s.get("market_context", {}).items() if k != "_df"}
 
     try:
-        with sqlite3.connect(db_path) as con:
+        with _sqlite_connect(db_path) as con:
             con.execute("""
                 INSERT INTO memories
                   (timestamp, symbol, direction, entry_price, exit_price,
@@ -366,7 +364,7 @@ def run(args):
             pct = (i - _WARMUP) / (end_idx - _WARMUP) * 100
             log.info(f"  {pct:.0f}% done — {len(signals)} signals found")
 
-    log.info(f"\nScan complete:")
+    log.info("\nScan complete:")
     log.info(f"  Signals found:        {len(signals)}")
     log.info(f"  Skipped (regime):     {skipped_regime}")
     log.info(f"  Skipped (no signal):  {skipped_no_signal}")

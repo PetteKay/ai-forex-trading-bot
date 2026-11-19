@@ -376,7 +376,6 @@ def _candlestick_patterns(df: pd.DataFrame) -> list[str]:
         b3 = df.iloc[-4]
 
         b4o, b4c = float(b4["open"]), float(b4["close"])
-        b4h, b4l = float(b4["high"]), float(b4["low"])
         b3o, b3c = float(b3["open"]), float(b3["close"])
         b3h, b3l = float(b3["high"]), float(b3["low"])
         b4_body  = abs(b4c - b4o)
@@ -653,7 +652,6 @@ def market_fingerprint(ctx: dict) -> str:
     Encode the market state as a compact string for memory similarity lookup.
     10 characters: trend/ema/rsi/macd/structure/rsi-state/htf/volume/stoch/divergence.
     """
-    rsi = ctx.get("rsi", 50)
     parts = [
         "T" if ctx.get("price_above_trend") else "t",
         "F" if ctx.get("fast_above_slow") else "f",
