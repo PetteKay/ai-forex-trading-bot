@@ -10,6 +10,7 @@ Usage:
 """
 
 import sqlite3
+from sqlite_conn import connect as _sqlite_connect
 import os
 import logging
 from datetime import datetime, timezone, timedelta
@@ -39,15 +40,13 @@ def generate_daily_report(
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
     try:
-        con = sqlite3.connect(db_path)
-        con.row_factory = sqlite3.Row
-
-        rows = con.execute("""
-            SELECT symbol, regime, pnl, pnl_pct, outcome
-            FROM trades
-            WHERE status='CLOSED' AND exit_time >= ?
-        """, (cutoff,)).fetchall()
-        con.close()
+        with _sqlite_connect(db_path) as con:
+            con.row_factory = sqlite3.Row
+            rows = con.execute("""
+                SELECT symbol, regime, pnl, pnl_pct, outcome
+                FROM trades
+                WHERE status='CLOSED' AND exit_time >= ?
+            """, (cutoff,)).fetchall()
 
         if not rows:
             msg = f"No closed trades in the last {days} day(s)."

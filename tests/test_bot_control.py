@@ -18,7 +18,6 @@ import importlib.util
 import json
 import os
 import random
-import signal
 import subprocess
 import sys
 import tempfile
@@ -32,8 +31,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FAKE = os.path.join(ROOT, "tests", "fake_mt5")
 sys.path.insert(0, ROOT)
 
-import numpy as np    # noqa: E402,F401  (load once, before any module juggling)
-import pandas as pd   # noqa: E402,F401
+import importlib  # noqa: E402
+for _m in ("numpy", "pandas"):   # load once, before any module juggling
+    importlib.import_module(_m)
 import bot_control as bc  # noqa: E402
 
 
@@ -425,12 +425,14 @@ class BotLoop(unittest.TestCase):
         try:
             rows = [x for x in j.get_recent_trades(50) if x["ticket"] == 555]
             self.assertEqual(rows[0]["status"], "CLOSED")
-            import sqlite3
-            with sqlite3.connect(config.MEMORY_DB_PATH) as con:
+            from sqlite_conn import connect
+            with connect(config.MEMORY_DB_PATH) as con:
                 n = con.execute("SELECT COUNT(*) FROM ml_samples WHERE ticket=555").fetchone()[0]
             self.assertEqual(n, 1)
-            gov = json.load(open([os.path.join("observability", f) for f in os.listdir("observability")
-                                  if f.startswith("governor_state")][0]))
+            gpath = [os.path.join("observability", f) for f in os.listdir("observability")
+                     if f.startswith("governor_state")][0]
+            with open(gpath) as fh:
+                gov = json.load(fh)
             # close time unknown here, so it counts on the entry day (today): once, not 3x
             self.assertEqual(float(gov["daily_pnl"]), -30.0)
         finally:
@@ -525,13 +527,16 @@ class McpProcesses(unittest.TestCase):
         self.assertEqual(st["bot"]["mode"], "demo")
         self.assertIn("already running", s.start_bot()["error"])
         gov_file = [f for f in os.listdir("observability") if f.startswith("governor_state")][0]
-        before = open(os.path.join("observability", gov_file)).read()
+        def gov_text():
+            with open(os.path.join("observability", gov_file)) as fh:
+                return fh.read()
+        before = gov_text()
         # one trader per account: the MCP server does not trade or write the governor
         p = s.place_trade("USDJPY", "BUY")
         self.assertFalse(p["placed"])
         self.assertTrue(any("bot.py is running" in b for b in p["blockers"]), p["blockers"])
         self.assertEqual(len(self.fake.orders_sent), 1)
-        self.assertEqual(open(os.path.join("observability", gov_file)).read(), before)
+        self.assertEqual(gov_text(), before)
         self.assertTrue(s.pause_trading()["bot_confirmed"])
         self.assertTrue(s.bot_status()["bot"]["paused"])
         c = s.close_position(placed["ticket"])
@@ -577,7 +582,7 @@ class McpProcesses(unittest.TestCase):
         self.assertFalse(bc.bot_state()["running"])
         self.assertTrue(s.start_bot()["started"])                  # a crash: kill -9
         pid = bc.read_status()["pid"]
-        os.kill(pid, signal.SIGKILL)
+        self.assertTrue(bc.kill_pid(pid))     # hard kill (SIGKILL / TerminateProcess)
         s._CHILDREN[pid].wait(5)
         self.assertFalse(bc.bot_state()["running"], "OS did not free the lock")
         self.assertTrue(s.place_trade("EURUSD", "BUY")["placed"])

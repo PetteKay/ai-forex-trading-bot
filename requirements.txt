@@ -1,4 +1,4 @@
-MetaTrader5>=5.0.45
+MetaTrader5>=5.0.45; sys_platform == "win32"   # the MT5 Python package exists only for Windows
 openai>=1.30.0
 anthropic>=0.30.0
 pandas>=2.0.0

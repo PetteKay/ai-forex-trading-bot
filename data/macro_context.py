@@ -23,7 +23,6 @@ import threading
 import time
 from datetime import datetime, timezone
 from urllib.request import urlopen, Request
-from urllib.error import URLError
 
 log = logging.getLogger("MacroContext")
 
@@ -75,7 +74,9 @@ def _fetch_all(symbol: str) -> dict:
     its result (the cache write happens in the parent, in get_macro_context).
     """
     try:
-        import yfinance  # noqa — raise ImportError early if not installed
+        import importlib.util
+        if importlib.util.find_spec("yfinance") is None:   # not installed
+            raise ImportError("yfinance")
     except ImportError:
         log.warning("yfinance not installed — macro context unavailable. Run: py -m pip install yfinance")
         return {}

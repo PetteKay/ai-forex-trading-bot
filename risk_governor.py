@@ -14,7 +14,7 @@ Design formally verified with TLA+ (specs/RiskGovernor.tla).
 """
 
 from decimal import Decimal
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from typing import Optional
 import json
 import logging

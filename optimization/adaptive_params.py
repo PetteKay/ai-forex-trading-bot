@@ -21,7 +21,7 @@ Usage:
   new_threshold, reason = compute_adaptive_confidence(db_path, lookback=30, current=50)
 """
 
-import sqlite3
+from sqlite_conn import connect as _sqlite_connect
 import os
 import logging
 
@@ -52,7 +52,7 @@ def compute_adaptive_confidence(
         return current_threshold, "No journal — no adjustment"
 
     try:
-        with sqlite3.connect(db_path) as con:
+        with _sqlite_connect(db_path) as con:
             rows = con.execute("""
                 SELECT confidence, pnl
                 FROM trades
@@ -124,7 +124,7 @@ def analyze_by_confidence_band(db_path: str, lookback_trades: int = 50) -> dict:
         return result
 
     try:
-        with sqlite3.connect(db_path) as con:
+        with _sqlite_connect(db_path) as con:
             rows = con.execute("""
                 SELECT confidence, pnl
                 FROM trades

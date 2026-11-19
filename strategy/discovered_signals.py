@@ -29,11 +29,9 @@ never trust file existence alone).
 import json
 import logging
 import math
-import os
 import time
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 log = logging.getLogger("DiscoveredSignals")

@@ -148,7 +148,6 @@ def check_fibonacci(symbol: str, price: float, df: pd.DataFrame) -> dict:
     """
     sym      = symbol.upper().split(".")[0]
     pip      = _pip_size(sym)
-    interval = _get_interval(sym)
 
     empty = {
         "at_fib_level": False, "fib_ratio": None, "fib_label": "",

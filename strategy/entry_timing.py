@@ -49,7 +49,6 @@ def check(
     price = float(close.iloc[-1])
 
     ema9  = float(close.ewm(span=9,  adjust=False).mean().iloc[-1])
-    ema21 = float(close.ewm(span=21, adjust=False).mean().iloc[-1])
 
     rsi          = _rsi(close)
     atr_distance = abs(price - ema9) / h1_atr  # how far price is from EMA9 in ATR units

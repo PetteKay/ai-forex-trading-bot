@@ -18,6 +18,7 @@ Usage:
 """
 
 import sqlite3
+from sqlite_conn import connect as _sqlite_connect
 import json
 import os
 import logging
@@ -48,7 +49,7 @@ class Journal:
         fingerprint: str,
         ctx_json: dict = None,
     ) -> None:
-        with sqlite3.connect(self._db) as con:
+        with _sqlite_connect(self._db) as con:
             con.execute("""
                 INSERT INTO ticks (
                     timestamp, symbol, timeframe, price, regime, tech_bias,
@@ -77,7 +78,7 @@ class Journal:
         fingerprint: str,
         size_multiplier: float = 1.0,
     ) -> None:
-        with sqlite3.connect(self._db) as con:
+        with _sqlite_connect(self._db) as con:
             con.execute("""
                 INSERT OR REPLACE INTO trades (
                     ticket, symbol, direction, entry_price, sl, tp, volume,
@@ -100,7 +101,7 @@ class Journal:
         hold_hours: float,
         exit_reason: str = "UNKNOWN",
     ) -> None:
-        with sqlite3.connect(self._db) as con:
+        with _sqlite_connect(self._db) as con:
             con.execute("""
                 UPDATE trades SET
                     exit_price=?, pnl=?, pnl_pct=?, outcome=?,
@@ -114,14 +115,14 @@ class Journal:
             ))
 
     def log_equity(self, equity: float, daily_pnl: float, open_positions: int) -> None:
-        with sqlite3.connect(self._db) as con:
+        with _sqlite_connect(self._db) as con:
             con.execute("""
                 INSERT INTO equity_log (timestamp, equity, daily_pnl, open_positions)
                 VALUES (?,?,?,?)
             """, (datetime.now(timezone.utc).isoformat(), equity, daily_pnl, open_positions))
 
     def get_recent_trades(self, n: int = 20) -> list[dict]:
-        with sqlite3.connect(self._db) as con:
+        with _sqlite_connect(self._db) as con:
             con.row_factory = sqlite3.Row
             rows = con.execute(
                 "SELECT * FROM trades ORDER BY entry_time DESC LIMIT ?", (n,)
@@ -129,7 +130,7 @@ class Journal:
         return [dict(r) for r in rows]
 
     def get_equity_curve(self) -> list[dict]:
-        with sqlite3.connect(self._db) as con:
+        with _sqlite_connect(self._db) as con:
             con.row_factory = sqlite3.Row
             rows = con.execute(
                 "SELECT timestamp, equity FROM equity_log ORDER BY timestamp"
@@ -137,7 +138,7 @@ class Journal:
         return [dict(r) for r in rows]
 
     def print_summary(self) -> None:
-        with sqlite3.connect(self._db) as con:
+        with _sqlite_connect(self._db) as con:
             total   = con.execute("SELECT COUNT(*) FROM trades WHERE status='CLOSED'").fetchone()[0]
             wins    = con.execute("SELECT COUNT(*) FROM trades WHERE pnl > 0").fetchone()[0]
             avg_pnl = con.execute("SELECT AVG(pnl) FROM trades WHERE status='CLOSED'").fetchone()[0] or 0
@@ -155,7 +156,7 @@ class Journal:
 
     def add_blacklist_loss(self, symbol: str, regime: str) -> int:
         """Record a consecutive loss for this symbol+regime. Returns new count."""
-        with sqlite3.connect(self._db) as con:
+        with _sqlite_connect(self._db) as con:
             con.execute("""
                 INSERT INTO setup_blacklist (symbol, regime, consecutive_losses, last_loss_time)
                 VALUES (?, ?, 1, ?)
@@ -171,7 +172,7 @@ class Journal:
 
     def reset_blacklist(self, symbol: str, regime: str) -> None:
         """Reset consecutive loss counter after a win."""
-        with sqlite3.connect(self._db) as con:
+        with _sqlite_connect(self._db) as con:
             con.execute("""
                 UPDATE setup_blacklist SET consecutive_losses=0
                 WHERE symbol=? AND regime=?
@@ -180,7 +181,7 @@ class Journal:
     def is_blacklisted(self, symbol: str, regime: str, threshold: int = 3) -> bool:
         """Return True if this symbol+regime has >= threshold consecutive losses."""
         try:
-            with sqlite3.connect(self._db) as con:
+            with _sqlite_connect(self._db) as con:
                 row = con.execute(
                     "SELECT consecutive_losses FROM setup_blacklist WHERE symbol=? AND regime=?",
                     (symbol.upper(), regime)
@@ -202,7 +203,7 @@ class Journal:
         regime: str = "",
     ) -> None:
         """Record agent votes at trade open. Outcome updated when trade closes."""
-        with sqlite3.connect(self._db) as con:
+        with _sqlite_connect(self._db) as con:
             con.execute("""
                 INSERT OR IGNORE INTO agent_votes
                     (ticket, tech_bias, tech_strength, bear_risk, pm_action, pm_confidence, regime, voted_at)
@@ -215,7 +216,7 @@ class Journal:
 
     def update_agent_outcome(self, ticket: int, is_win: bool) -> None:
         """Mark the trade outcome so accuracy can be computed."""
-        with sqlite3.connect(self._db) as con:
+        with _sqlite_connect(self._db) as con:
             con.execute("""
                 UPDATE agent_votes SET outcome_is_win=? WHERE ticket=?
             """, (1 if is_win else 0, ticket))
@@ -231,7 +232,7 @@ class Journal:
           n_trades:           int
         """
         try:
-            with sqlite3.connect(self._db) as con:
+            with _sqlite_connect(self._db) as con:
                 rows = con.execute("""
                     SELECT tech_bias, tech_strength, bear_risk, pm_action, pm_confidence, outcome_is_win
                     FROM agent_votes
@@ -281,7 +282,7 @@ class Journal:
         }
 
     def _init_db(self):
-        with sqlite3.connect(self._db) as con:
+        with _sqlite_connect(self._db) as con:
             # WAL mode prevents "database is locked" when equity_chart.py reads
             # concurrently while the bot is writing.
             con.execute("PRAGMA journal_mode=WAL")

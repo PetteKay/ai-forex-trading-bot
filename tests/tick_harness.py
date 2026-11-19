@@ -55,7 +55,7 @@ def _bars(n, freq, seed):
 def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None,
                  ticks=1, cfg_extra=None, on_tick_end=None, reflect_result=None,
                  close_pnl=1.0, workdir=None, start_positions=None, control=None,
-                 before_pm=None, closed_history=None):
+                 before_pm=None, closed_history=None, demo=False):
     """Run `ticks` loop iterations. Returns dict(tick_seconds of the first tick,
     llm_calls, orders, threads_seen, mt5_threads, error, closes, control).
 
@@ -209,10 +209,10 @@ def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None,
     try:
         ctl = control() if control else None
         tick["start"] = time.perf_counter()
-        bot.run(demo_mode=False, control=ctl)
+        bot.run(demo_mode=demo, control=ctl)
     except SystemExit as e:
         err = f"SystemExit {e}"
-    except Exception as e:  # pragma: no cover - reported to caller
+    except Exception:  # pragma: no cover - reported to caller
         import traceback
         err = traceback.format_exc()
     finally:

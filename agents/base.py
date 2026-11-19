@@ -22,7 +22,6 @@ import json
 import logging
 import re
 import time
-from typing import Optional
 
 log = logging.getLogger("LLM")
 

@@ -9,6 +9,7 @@ Philosophy: quality over quantity.
 """
 
 import sqlite3
+from sqlite_conn import connect as _sqlite_connect
 import json
 import math
 import os
@@ -65,7 +66,7 @@ class TradeMemoryStore:
         except Exception as e:
             log.debug(f"Semantic embedding skipped: {e}")
 
-        with sqlite3.connect(self._db) as con:
+        with _sqlite_connect(self._db) as con:
             con.execute("""
                 INSERT INTO memories
                   (timestamp, symbol, direction, entry_price, exit_price,
@@ -116,7 +117,7 @@ class TradeMemoryStore:
         Uses fingerprint matching first; if feature_vector is supplied,
         re-ranks candidates by cosine similarity.
         """
-        with sqlite3.connect(self._db) as con:
+        with _sqlite_connect(self._db) as con:
             con.row_factory = sqlite3.Row
 
             rows = con.execute("""
@@ -272,7 +273,7 @@ class TradeMemoryStore:
         except Exception:
             return []
 
-        with sqlite3.connect(self._db) as con:
+        with _sqlite_connect(self._db) as con:
             con.row_factory = sqlite3.Row
             rows = con.execute(
                 "SELECT * FROM memories WHERE symbol = ? AND lesson_embedding IS NOT NULL",
@@ -316,7 +317,7 @@ class TradeMemoryStore:
         Store one closed trade as ML training data — every closed trade, with no
         usefulness filter and no pruning. Idempotent per ticket.
         """
-        with sqlite3.connect(self._db) as con:
+        with _sqlite_connect(self._db) as con:
             con.execute("""
                 INSERT OR IGNORE INTO ml_samples
                   (ticket, symbol, direction, entry_time, exit_time, feature_vector,
@@ -348,7 +349,7 @@ class TradeMemoryStore:
                           entry_time: str, entry_price: float, risk_usd: float,
                           context: dict, tech: dict | None = None, pm: dict | None = None,
                           source: str = "bot", reason: str = "") -> None:
-        with sqlite3.connect(self._db) as con:
+        with _sqlite_connect(self._db) as con:
             con.execute("""
                 INSERT OR REPLACE INTO open_trade_context
                   (ticket, symbol, direction, entry_time, entry_price, risk_usd,
@@ -359,7 +360,7 @@ class TradeMemoryStore:
                   source, reason or ""))
 
     def get_open_context(self, ticket: int) -> dict | None:
-        with sqlite3.connect(self._db) as con:
+        with _sqlite_connect(self._db) as con:
             con.row_factory = sqlite3.Row
             r = con.execute("SELECT * FROM open_trade_context WHERE ticket=?", (ticket,)).fetchone()
         if not r:
@@ -370,31 +371,31 @@ class TradeMemoryStore:
         return d
 
     def delete_open_context(self, ticket: int) -> None:
-        with sqlite3.connect(self._db) as con:
+        with _sqlite_connect(self._db) as con:
             con.execute("DELETE FROM open_trade_context WHERE ticket=?", (ticket,))
 
     # ── Lesson reviews (MCP: the connected AI writes the lesson) ─────────────
 
     def queue_review(self, ticket: int, payload: dict) -> None:
-        with sqlite3.connect(self._db) as con:
+        with _sqlite_connect(self._db) as con:
             con.execute("INSERT OR IGNORE INTO lesson_reviews (ticket, payload, status, created) "
                         "VALUES (?,?, 'PENDING', ?)",
                         (ticket, json.dumps(payload), datetime.now(timezone.utc).isoformat()))
 
     def pending_reviews(self, limit: int = 20) -> list[dict]:
-        with sqlite3.connect(self._db) as con:
+        with _sqlite_connect(self._db) as con:
             rows = con.execute("SELECT ticket, payload FROM lesson_reviews WHERE status='PENDING' "
                                "ORDER BY created ASC LIMIT ?", (limit,)).fetchall()
         return [dict(json.loads(p), ticket=t) for t, p in rows]
 
     def get_review(self, ticket: int) -> dict | None:
-        with sqlite3.connect(self._db) as con:
+        with _sqlite_connect(self._db) as con:
             r = con.execute("SELECT payload, status FROM lesson_reviews WHERE ticket=?",
                             (ticket,)).fetchone()
         return dict(json.loads(r[0]), ticket=ticket, status=r[1]) if r else None
 
     def complete_review(self, ticket: int, status: str) -> None:
-        with sqlite3.connect(self._db) as con:
+        with _sqlite_connect(self._db) as con:
             con.execute("UPDATE lesson_reviews SET status=? WHERE ticket=?", (status, ticket))
 
     def get_all_for_training(self) -> list[dict]:
@@ -405,7 +406,7 @@ class TradeMemoryStore:
             lessons saved before ml_samples existed (ml_sampled = 0).
         Live trades whose lesson was also saved (ml_sampled = 1) appear once.
         """
-        with sqlite3.connect(self._db) as con:
+        with _sqlite_connect(self._db) as con:
             con.row_factory = sqlite3.Row
             rows = con.execute(
                 "SELECT * FROM memories WHERE COALESCE(ml_sampled, 0) = 0 "
@@ -457,7 +458,7 @@ class TradeMemoryStore:
         ]
 
     def stats(self) -> dict:
-        with sqlite3.connect(self._db) as con:
+        with _sqlite_connect(self._db) as con:
             total  = con.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
             avg_u  = con.execute("SELECT AVG(usefulness_score) FROM memories").fetchone()[0] or 0
             outcomes = dict(con.execute(
@@ -468,7 +469,7 @@ class TradeMemoryStore:
     # ── Internal ──────────────────────────────────────────────────────────────
 
     def _init_db(self):
-        with sqlite3.connect(self._db) as con:
+        with _sqlite_connect(self._db) as con:
             # WAL mode: allows concurrent readers while writer is active;
             # prevents "database is locked" under the 60s bot tick loop.
             con.execute("PRAGMA journal_mode=WAL")
@@ -564,7 +565,7 @@ class TradeMemoryStore:
             con.execute("CREATE INDEX IF NOT EXISTS idx_timestamp   ON memories(timestamp)")
 
     def _prune_if_needed(self):
-        with sqlite3.connect(self._db) as con:
+        with _sqlite_connect(self._db) as con:
             total = con.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
             if total > self._max * 1.2:
                 excess = total - self._max

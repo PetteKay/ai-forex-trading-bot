@@ -9,7 +9,6 @@ fingerprint-only recall rather than crashing.
 """
 
 import logging
-from functools import lru_cache
 
 log = logging.getLogger("Semantic")
 

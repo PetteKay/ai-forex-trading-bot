@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    name: tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install (tests use a fake MT5 terminal, not the real package)
+        shell: bash
+        run: |
+          grep -v '^MetaTrader5' requirements.txt > ci-requirements.txt
+          python -m pip install --upgrade pip
+          python -m pip install -r ci-requirements.txt pyflakes
+      - name: Lint
+        shell: bash
+        run: git ls-files '*.py' | grep -v '^signal-discovery/' | xargs python -m pyflakes
+      - name: Tests
+        run: python -m pytest tests -q -p no:cacheprovider
+
+  tla:
+    name: TLA+ model checking (TLC)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Get TLC
+        run: curl -sSL -o tla2tools.jar https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+      - name: Check every spec
+        working-directory: specs
+        run: |
+          set -e
+          run() {  # module config
+            echo "::group::$1 ($2)"
+            java -XX:+UseParallelGC -Xmx12g -cp ../tla2tools.jar tlc2.TLC -workers auto -cleanup \
+                 "$1.tla" -config "$2" | tee "/tmp/$2.log"
+            echo "::endgroup::"
+            grep -q "No error has been found" "/tmp/$2.log" || { echo "::error::$1 ($2) failed"; exit 1; }
+            grep -E "distinct states found" "/tmp/$2.log" | tail -1
+          }
+          run RiskGovernor      RiskGovernor.cfg
+          run PositionLifecycle PositionLifecycle.cfg
+          run BotControl        BotControl.cfg
+          run BotControl        BotControlLive.cfg
+          run OrderStateMachine OrderStateMachine.cfg

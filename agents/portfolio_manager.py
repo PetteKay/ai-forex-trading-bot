@@ -11,7 +11,6 @@ Debates both sides and makes the final BUY/SELL/HOLD decision.
 This is the most important agent — quality of reasoning here determines profitability.
 """
 
-import json
 import logging
 from agents import base
 

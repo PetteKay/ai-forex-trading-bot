@@ -201,7 +201,7 @@ def run_demo(memory: TradeMemoryStore):
             saved += 1
             log.info(f"  ✓ Lesson: {lesson_record['lesson'][:100]}")
         else:
-            log.info(f"  — Nothing worth saving from this trade.")
+            log.info("  — Nothing worth saving from this trade.")
 
     log.info(f"\nDemo training done: {saved}/{len(SAMPLE_TRADES)} lessons saved.")
     log.info(f"Memory stats: {memory.stats()}")

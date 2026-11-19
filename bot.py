@@ -36,7 +36,7 @@ from agents.desk import run_desk
 from strategy.bar_gate import BarGate
 from memory.trade_learning import (classify_outcome, update_blacklist, save_training_sample,
                                    lesson_fields, json_safe_context)
-from strategy.correlation import _CORR_GROUPS, _check_correlation  # noqa: F401
+from strategy.correlation import _check_correlation
 
 # Fix Windows console encoding so Unicode box-drawing chars don't crash the logger
 if hasattr(sys.stdout, "reconfigure"):
@@ -71,7 +71,7 @@ _DESK_AGENTS = {
 }
 from data.news_feed import fetch_headlines
 try:
-    from data.macro_context import get_macro_context, macro_summary_for_llm
+    from data.macro_context import get_macro_context
     _MACRO_AVAILABLE = True
 except ImportError:
     _MACRO_AVAILABLE = False
@@ -161,14 +161,15 @@ from notifications.telegram_alert import TelegramAlert
 from concurrent.futures import ThreadPoolExecutor
 
 # ── Logging ──────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("bot.log", encoding="utf-8"),
-    ],
-)
+if not logging.getLogger().handlers:      # once per process (bot.log isn't reopened)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler("bot.log", encoding="utf-8"),
+        ],
+    )
 log = logging.getLogger("Bot")
 
 
@@ -344,9 +345,10 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False, control=None
                            if p["ticket"] == _t), None)
                 if _p is None:
                     control.report_close(_t, "not open")          # [BotDropClose]
-                elif demo_mode:
-                    control.report_close(_t, "demo mode: not closed")
                 else:
+                    # Done in demo mode too: it is your explicit request (the MCP
+                    # server only sends it in live mode), and while this bot holds
+                    # the account nothing else may close the position.
                     _ok = mt5b.close_position(_t, _p["symbol"], _p["volume"], _p["type"],
                                               magic=config.MAGIC_NUMBER)
                     control.report_close(_t, "closed" if _ok else "failed")
@@ -1235,7 +1237,6 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False, control=None
                             _im = get_intermarket_bias(symbol, action, live_macro)
                             _im_adj = _im.get("confidence_adj", 0)
                             if _im_adj != 0:
-                                old_conf   = confidence
                                 confidence = max(0, min(100, confidence + _im_adj))
                                 pm["confidence"] = confidence
                                 log.info(

@@ -49,25 +49,36 @@ def book_closed_trades(*, journal, memory, governor, meta_gate, mt5b, magic: int
         if not closed:
             continue          # history not available yet — try again next time
         net = float(closed.get("net_pnl", 0.0))
-        exit_utc = None
-        try:
-            et = closed.get("exit_time")
-            if et is not None:
-                ts = et.replace(tzinfo=timezone.utc).timestamp() if et.tzinfo is None else et.timestamp()
-                with lock:
-                    exit_utc = mt5b.terminal_time_to_utc(int(ts), sym)
-        except Exception:
-            exit_utc = None
+        exit_utc = _exit_time_utc(mt5b, closed.get("exit_time"), sym, cfg, lock)
         if exit_utc is not None:
             counts_today = exit_utc.date() == today
-        else:   # offset not measurable (market closed): fall back to the entry date
-            counts_today = str(row.get("entry_time", ""))[:10] == today.isoformat()
+        else:
+            # No fresh tick on any symbol, so the terminal clock can't be read.
+            # Err on the safe side of the daily loss cap: a loss counts today
+            # (it may be today's), a profit doesn't (it could hide today's losses).
+            counts_today = net < 0
+            log.warning(f"Close time of {ticket} unknown (no fresh tick): "
+                        f"{'counted' if counts_today else 'not counted'} in today's P&L")
 
         snap = memory.get_open_context(ticket) or {}
         ctx  = snap.get("context") or {}
-        risk_usd   = float(snap.get("risk_usd") or 0.0)
-        r_multiple = (net / risk_usd) if risk_usd > 0 else 0.0
-        outcome    = classify_outcome(r_multiple)
+        risk_usd = float(snap.get("risk_usd") or 0.0)
+        if risk_usd <= 0:              # no snapshot (older trade / failed write): from the journal
+            try:
+                if float(row.get("sl") or 0) > 0 and float(row.get("entry_price") or 0) > 0:
+                    with lock:
+                        risk_usd = float(mt5b.get_risk_usd(sym, float(row["entry_price"]),
+                                                           float(row["sl"]),
+                                                           float(row.get("volume") or 0)) or 0.0)
+            except Exception as e:
+                log.debug(f"Risk of {ticket} not recoverable: {e}")
+                risk_usd = 0.0
+        if risk_usd > 0:
+            r_multiple = net / risk_usd
+            outcome    = classify_outcome(r_multiple)
+        else:                          # risk unknown: grade by the sign of the result
+            r_multiple = None
+            outcome    = "WIN" if net > 0 else "LOSS" if net < 0 else "BREAKEVEN"
         pnl_pct    = (net / equity) * 100 if equity else 0.0
         try:
             entry_dt = datetime.fromisoformat(snap.get("entry_time") or row.get("entry_time"))
@@ -90,11 +101,11 @@ def book_closed_trades(*, journal, memory, governor, meta_gate, mt5b, magic: int
         sample = save_training_sample(
             memory, gate, ticket=ticket, symbol=sym, direction=direction,
             entry_time=entry_dt, exit_time=exit_utc or now, entry_context=ctx,
-            r_multiple=r_multiple, pnl_pct=pnl_pct, outcome=outcome, is_win=net > 0)
+            r_multiple=r_multiple or 0.0, pnl_pct=pnl_pct, outcome=outcome, is_win=net > 0)
 
         try:
             lesson = lesson_for(memory, cfg, ticket, sym, direction, snap, ctx, row, closed,
-                                pnl_pct, r_multiple, outcome, hold,
+                                pnl_pct, r_multiple or 0.0, outcome, hold,
                                 llm_state if llm_state is not None else {}) \
                 if ctx else "no entry snapshot"
         except Exception as e:
@@ -103,16 +114,40 @@ def book_closed_trades(*, journal, memory, governor, meta_gate, mt5b, magic: int
         if telegram is not None:
             try:
                 telegram.trade_close(symbol=sym, direction=direction, outcome=outcome, pnl=net,
-                                     r_multiple=r_multiple, hold_hours=hold)
+                                     r_multiple=r_multiple or 0.0, hold_hours=hold)
             except Exception:
                 pass
         booked.append({"ticket": ticket, "symbol": sym, "net_pnl": net,
-                       "r_multiple": round(r_multiple, 2), "outcome": outcome,
+                       "r_multiple": None if r_multiple is None else round(r_multiple, 2),
+                       "outcome": outcome,
                        "counted_in_today": counts_today, "ml_sample": bool(sample),
                        "lesson": lesson})
-        log.info(f"Booked closed trade {ticket} {sym}: {net:+.2f} ({outcome}, R={r_multiple:+.2f})"
+        log.info(f"Booked closed trade {ticket} {sym}: {net:+.2f} ({outcome}, "
+                 f"R={'?' if r_multiple is None else f'{r_multiple:+.2f}'})"
                  f"{'' if counts_today else ' (not today — journal only)'}")
     return booked
+
+
+def _exit_time_utc(mt5b, exit_time, sym, cfg, lock):
+    """The deal's close time in UTC. The terminal's clock offset is measured from
+    a fresh tick; every symbol shares that clock, so if the trade's own symbol is
+    stale (closed market) any other watched symbol with a fresh tick will do."""
+    if exit_time is None:
+        return None
+    try:
+        ts = int(exit_time.replace(tzinfo=timezone.utc).timestamp() if exit_time.tzinfo is None
+                 else exit_time.timestamp())
+    except Exception:
+        return None
+    for s in [sym] + [x for x in (getattr(cfg, "SYMBOLS", None) or []) if x != sym]:
+        try:
+            with lock:
+                t = mt5b.terminal_time_to_utc(ts, s)
+        except Exception:
+            t = None
+        if t is not None:
+            return t
+    return None
 
 
 def lesson_for(memory, cfg, ticket, sym, direction, snap, ctx, row, closed,

@@ -26,8 +26,9 @@ FAKE = os.path.join(ROOT, "tests", "fake_mt5")
 sys.path.insert(0, ROOT)
 logging.disable(logging.CRITICAL)
 
-import numpy as np    # noqa: E402,F401
-import pandas as pd   # noqa: E402,F401
+import importlib  # noqa: E402
+for _m in ("numpy", "pandas"):   # load once, before any module juggling
+    importlib.import_module(_m)
 
 
 def _load_fake_mt5():
@@ -254,7 +255,8 @@ class MCPInProcess(unittest.TestCase):
     # ── MCP trades learn like bot.py trades ──────────────────────────────
     def _db_rows(self, sql, *args):
         import sqlite3
-        with sqlite3.connect(self.config.MEMORY_DB_PATH) as con:
+        from sqlite_conn import connect
+        with connect(self.config.MEMORY_DB_PATH) as con:
             con.row_factory = sqlite3.Row
             return [dict(r) for r in con.execute(sql, args)]
 
