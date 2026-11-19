@@ -120,14 +120,24 @@ class MCPInProcess(unittest.TestCase):
         tools = {t.name: t for t in self.list_tools()}
         expected = {"get_account_status", "analyze_market", "get_news", "get_ml_probability",
                     "recall_lessons", "get_recent_trades", "preview_trade", "place_trade",
-                    "close_position", "get_trades_to_review", "save_lesson"}
+                    "close_position", "get_trades_to_review", "save_lesson",
+                    "bot_status", "get_bot_log", "start_bot", "stop_bot", "restart_bot",
+                    "pause_trading", "resume_trading", "get_settings", "update_settings",
+                    "reset_settings", "retrain_ml_model", "run_training", "get_training_job"}
         self.assertEqual(set(tools), expected)
-        for n in ("place_trade", "close_position"):
-            self.assertTrue(tools[n].annotations.destructive_hint)
-        self.assertFalse(tools["save_lesson"].annotations.read_only_hint)
-        self.assertFalse(tools["save_lesson"].annotations.destructive_hint)
-        for n in expected - {"place_trade", "close_position", "save_lesson"}:
-            self.assertTrue(tools[n].annotations.read_only_hint)
+        # can start or loosen trading -> destructive (clients ask before calling)
+        risky = {"place_trade", "close_position", "start_bot", "restart_bot",
+                 "resume_trading", "reset_settings"}
+        # change state but only make things safer / add data
+        safe_writes = {"save_lesson", "stop_bot", "pause_trading", "update_settings",
+                       "retrain_ml_model", "run_training"}
+        for n in risky:
+            self.assertTrue(tools[n].annotations.destructive_hint, n)
+        for n in safe_writes:
+            self.assertFalse(tools[n].annotations.read_only_hint, n)
+            self.assertFalse(tools[n].annotations.destructive_hint, n)
+        for n in expected - risky - safe_writes:
+            self.assertTrue(tools[n].annotations.read_only_hint, n)
 
     def test_account_and_market(self):
         acct = self.call("get_account_status")

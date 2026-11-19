@@ -54,9 +54,15 @@ def _bars(n, freq, seed):
 
 def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None,
                  ticks=1, cfg_extra=None, on_tick_end=None, reflect_result=None,
-                 close_pnl=1.0, workdir=None, start_positions=None):
+                 close_pnl=1.0, workdir=None, start_positions=None, control=None,
+                 before_pm=None, closed_history=None):
     """Run `ticks` loop iterations. Returns dict(tick_seconds of the first tick,
-    llm_calls, orders, threads_seen, mt5_threads, error)."""
+    llm_calls, orders, threads_seen, mt5_threads, error, closes, control).
+
+    control: a factory called inside the work folder, returning the
+    bot_control.BotSide passed to bot.run(control=...).
+    before_pm(symbol): called just before each Fund Manager decision (mid-tick).
+    closed_history: {ticket: net_pnl} for get_closed_trade (default close_pnl)."""
     workdir = workdir or tempfile.mkdtemp()
     old_cwd = os.getcwd()
     os.chdir(workdir)
@@ -91,6 +97,8 @@ def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None,
 
     def _pm(*a, **k):
         sym = k["ctx"].get("symbol") or ""
+        if before_pm:
+            before_pm(sym)
         i = symbols.index(sym) if sym in symbols else 0
         if buy_every and i % buy_every == 0:
             return {"action": "BUY", "confidence": 85, "reasoning": "harness",
@@ -113,6 +121,12 @@ def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None,
             raise KeyboardInterrupt   # bot.run() treats this as a clean stop
 
     open_positions = list(start_positions or [])   # orders stay open until a test closes them
+    closes = []
+
+    def _close_position(ticket, symbol, volume, direction, magic=None, **k):
+        closes.append(ticket)
+        open_positions[:] = [p for p in open_positions if p["ticket"] != ticket]
+        return True
 
     def _place_order(**k):
         orders.append(k["symbol"])
@@ -154,7 +168,11 @@ def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None,
         mock.patch.object(mb, "place_order", side_effect=_mt5(_place_order)),
         mock.patch.object(mb, "get_closed_trade", side_effect=_mt5(lambda t, **k: {
             "ticket": t, "entry_price": 1.1, "exit_price": 1.11, "volume": 0.01, "pnl": 1.0,
-            "swap": 0.0, "commission": 0.0, "net_pnl": close_pnl})),
+            "swap": 0.0, "commission": 0.0,
+            "net_pnl": (closed_history or {}).get(t, close_pnl)})),
+        mock.patch.object(mb, "close_position", side_effect=_mt5(_close_position)),
+        mock.patch.object(mb, "terminal_time_to_utc", side_effect=lambda ts, sym=None: None,
+                          create=True),
         mock.patch.object(bot.llm, "init", return_value=None),
         mock.patch.object(bot.reflection, "reflect", side_effect=_agent(
             "reflection", lambda *a, **k: (dict(reflect_result, **{"symbol": k["symbol"],
@@ -185,11 +203,13 @@ def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None,
     sys.modules["memory.semantic"] = sem
 
     err = None
+    ctl = None
     for p in patches:
         p.start()
     try:
+        ctl = control() if control else None
         tick["start"] = time.perf_counter()
-        bot.run(demo_mode=False)
+        bot.run(demo_mode=False, control=ctl)
     except SystemExit as e:
         err = f"SystemExit {e}"
     except Exception as e:  # pragma: no cover - reported to caller
@@ -206,7 +226,8 @@ def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None,
     end = tick["end"] or time.perf_counter()
     return {"tick_seconds": round(end - tick["start"], 2), "llm_calls": dict(calls),
             "orders": orders, "threads_seen": len(threads_seen),
-            "mt5_threads": sorted(mt5_threads), "error": err, "workdir": workdir}
+            "mt5_threads": sorted(mt5_threads), "error": err, "workdir": workdir,
+            "closes": closes, "control": ctl, "ticks_run": tick.get("n", 0)}
 
 
 if __name__ == "__main__":

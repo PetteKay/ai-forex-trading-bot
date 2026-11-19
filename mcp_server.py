@@ -28,8 +28,10 @@ import json
 import logging
 import math
 import os
+import subprocess
 import sys
 import threading
+import time
 import types
 from urllib.parse import parse_qs
 
@@ -42,6 +44,7 @@ log = logging.getLogger("MCPServer")
 
 import config                                        # noqa: E402
 import mt5_bridge as mt5b                            # noqa: E402
+import bot_control                                   # noqa: E402
 from mcp.server.mcpserver import MCPServer           # noqa: E402
 from mcp.types import ToolAnnotations                # noqa: E402
 from risk_governor import RiskGovernor               # noqa: E402
@@ -60,7 +63,9 @@ server = MCPServer(
         "get_ml_probability and recall_lessons to form a view; preview_trade before place_trade. "
         "Every order passes the bot's risk governor (daily loss cap, max positions, drawdown "
         "halt), duplicate and correlation guards. Trading is dry-run unless the owner enabled "
-        "live mode. Nothing here is financial advice."
+        "live mode. bot_status / start_bot / stop_bot / pause_trading / update_settings / "
+        "retrain_ml_model / run_training control bot.py itself; only one of bot.py and this "
+        "server trades the account at a time. Nothing here is financial advice."
     ),
 )
 
@@ -135,8 +140,17 @@ def _market(symbol: str) -> tuple[str, dict]:
     return sym, ctx
 
 
+def _acct():
+    """The account lock (bot_control.py). Held by a running bot.py, or by this
+    server while it trades / books (specs/BotControl.tla: lock)."""
+    return bot_control.account_lock(bot_control.LOCK_PATH)
+
+
 def _governor(equity: float) -> RiskGovernor:
-    """Fresh governor from the shared state file, so restarts and the bot's limits apply."""
+    """Fresh governor from the shared state file, so restarts and the bot's limits
+    apply. It writes the file only while this server holds the account lock — when
+    bot.py runs, the bot owns that file (read-only here)."""
+    bot_control.apply_overrides(config)
     return RiskGovernor(
         starting_equity    = equity,
         daily_loss_cap_pct = config.DAILY_LOSS_CAP_PCT,
@@ -146,6 +160,7 @@ def _governor(equity: float) -> RiskGovernor:
         allowed_sessions   = config.ALLOWED_SESSIONS,
         state_path         = getattr(config, "GOVERNOR_STATE_PATH", "observability/governor_state.json"),
         account_id         = mt5b.get_account_login(),
+        persist            = _acct().held_here,
     )
 
 
@@ -153,128 +168,33 @@ def _book_closed_trades(gov: RiskGovernor) -> list[dict]:
     """
     Book trades that have closed since the last check — closed by close_position,
     by their stop loss / take profit, or while the server was not running — and
-    learn from them exactly as bot.py does (memory/trade_learning.py):
+    learn from them exactly as bot.py does (trade_booking.py, shared with bot.py):
 
       daily loss cap (governor) · journal · setup blacklist · ML-gate training
       sample + online update · periodic retrain · Telegram alert · lesson
 
-    Source: journal rows still OPEN whose ticket is no longer an open MT5
-    position. Each is booked once (the journal row is then CLOSED). Its P&L
-    counts toward today's limit only if the trade closed today (UTC).
+    Only while this server holds the account lock (call inside `_acct().hold()`):
+    when bot.py runs it books every close itself, so nothing is booked twice
+    (specs/BotControl.tla INV-BC-3).
     """
-    from datetime import datetime, timezone
-    from agents import reflection
-    from memory.trade_learning import (classify_outcome, update_blacklist,
-                                       save_training_sample, regime_of)
-    journal, memory = _journal(), _memory()
-    with _MT5_LOCK:
-        open_now = {p["ticket"] for p in mt5b.get_all_open_positions(_magic())}
-        equity = mt5b.get_account_equity()
-    booked = []
-    now = datetime.now(timezone.utc)
-    today = now.date()
-    for row in journal.get_recent_trades(200):
-        if row.get("status") != "OPEN" or row["ticket"] in open_now:
-            continue
-        ticket, sym = row["ticket"], row["symbol"]
-        with _MT5_LOCK:
-            closed = mt5b.get_closed_trade(ticket, max_wait_secs=0)
-        if not closed:
-            continue          # history not available yet — try again next time
-        net = float(closed.get("net_pnl", 0.0))
-        exit_utc = None
-        try:
-            et = closed.get("exit_time")
-            if et is not None:
-                ts = et.replace(tzinfo=timezone.utc).timestamp() if et.tzinfo is None else et.timestamp()
-                with _MT5_LOCK:
-                    exit_utc = mt5b.terminal_time_to_utc(int(ts), sym)
-        except Exception:
-            exit_utc = None
-        if exit_utc is not None:
-            counts_today = exit_utc.date() == today
-        else:   # offset not measurable (market closed): fall back to the entry date
-            counts_today = str(row.get("entry_time", ""))[:10] == today.isoformat()
-
-        snap = memory.get_open_context(ticket) or {}
-        ctx  = snap.get("context") or {}
-        risk_usd   = float(snap.get("risk_usd") or 0.0)
-        r_multiple = (net / risk_usd) if risk_usd > 0 else 0.0
-        outcome    = classify_outcome(r_multiple)
-        pnl_pct    = (net / equity) * 100 if equity else 0.0
-        try:
-            entry_dt = datetime.fromisoformat(snap.get("entry_time") or row.get("entry_time"))
-        except Exception:
-            entry_dt = now
-        hold = (now - entry_dt).total_seconds() / 3600
-        direction = snap.get("direction") or row.get("direction")
-
-        journal.log_trade_close(ticket=ticket, exit_price=closed.get("exit_price", 0.0),
-                                pnl=net, pnl_pct=pnl_pct, outcome=outcome,
-                                hold_hours=round(hold, 2), exit_reason="MCP_SYNC")
-        if counts_today:
-            gov.record_trade_closed(net)
-        update_blacklist(journal, config, sym, regime_of(ctx), net > 0)
-
-        sample = save_training_sample(
-            memory, _meta_gate(), ticket=ticket, symbol=sym, direction=direction,
-            entry_time=entry_dt, exit_time=exit_utc or now, entry_context=ctx,
-            r_multiple=r_multiple, pnl_pct=pnl_pct, outcome=outcome, is_win=net > 0)
-        if sample:
+    if not _acct().held_here:
+        return []
+    from trade_booking import book_closed_trades
+    try:
+        tg = _telegram()
+    except Exception:
+        tg = None
+    booked = book_closed_trades(journal=_journal(), memory=_memory(), governor=gov,
+                                meta_gate=_meta_gate, mt5b=mt5b, magic=_magic(), cfg=config,
+                                mt5_lock=_MT5_LOCK, telegram=tg, llm_state=_lazy)
+    for b in booked:
+        if b["ml_sample"]:
             _lazy["since_retrain"] = _lazy.get("since_retrain", 0) + 1
             if _lazy["since_retrain"] >= getattr(config, "META_RETRAIN_EVERY", 20):
-                _meta_gate().train(memory.get_all_for_training(),
+                _meta_gate().train(_memory().get_all_for_training(),
                                    training_lookback_days=getattr(config, "ML_TRAINING_LOOKBACK_DAYS", 180))
                 _lazy["since_retrain"] = 0
-
-        lesson = _lesson_for(reflection, ticket, sym, direction, snap, ctx, row, closed,
-                             pnl_pct, r_multiple, outcome, hold) if ctx else "no entry snapshot"
-        memory.delete_open_context(ticket)
-        try:
-            _telegram().trade_close(symbol=sym, direction=direction, outcome=outcome, pnl=net,
-                                    r_multiple=r_multiple, hold_hours=hold)
-        except Exception:
-            pass
-        booked.append({"ticket": ticket, "symbol": sym, "net_pnl": net, "r_multiple": round(r_multiple, 2),
-                       "outcome": outcome, "counted_in_today": counts_today,
-                       "ml_sample": bool(sample), "lesson": lesson})
-        log.info(f"Booked closed trade {ticket} {sym}: {net:+.2f} ({outcome}, R={r_multiple:+.2f})"
-                 f"{'' if counts_today else ' (not today — journal only)'}")
     return booked
-
-
-def _lesson_for(reflection, ticket, sym, direction, snap, ctx, row, closed,
-                pnl_pct, r_multiple, outcome, hold) -> str:
-    """Same selectivity as bot.py's reflection. Returns what happened."""
-    pm   = snap.get("pm") or {}
-    tech = snap.get("tech") or {}
-    if not reflection._pre_filter(r_multiple, int(pm.get("confidence", 0) or 0), outcome):
-        return "nothing to learn (below the reflection filter)"
-    mode = str(getattr(config, "MCP_LESSONS", "client")).lower()
-    if mode == "llm" and getattr(config, "LLM_API_KEY", ""):
-        from agents import base as llm
-        from memory.trade_learning import lesson_fields
-        if not _lazy.get("llm_ready"):
-            llm.init(config)
-            _lazy["llm_ready"] = True
-        rec = reflection.reflect(symbol=sym, direction=direction,
-                                 entry_price=float(snap.get("entry_price") or row.get("entry_price") or 0),
-                                 exit_price=float(closed.get("exit_price", 0.0)), pnl_pct=pnl_pct,
-                                 r_multiple=r_multiple, hold_hours=hold, outcome=outcome,
-                                 entry_context=ctx, technical_analysis=tech, pm_decision=pm, cfg=config)
-        if not rec:
-            return "reflection agent: nothing worth saving"
-        rec.update(lesson_fields(ctx, r_multiple, snap.get("entry_time")))
-        return "saved by reflection agent" if _memory().save(rec) else "below usefulness threshold"
-    _memory().queue_review(ticket, {
-        "symbol": sym, "direction": direction,
-        "entry_price": snap.get("entry_price") or row.get("entry_price"),
-        "exit_price": closed.get("exit_price"), "pnl_pct": round(pnl_pct, 3),
-        "r_multiple": round(r_multiple, 2), "outcome": outcome, "hold_hours": round(hold, 1),
-        "entry_time": snap.get("entry_time"), "reason_at_entry": snap.get("reason", ""),
-        "source": snap.get("source", ""), "entry_context": ctx, "tech": tech, "pm": pm,
-    })
-    return "queued for review — call get_trades_to_review, then save_lesson"
 
 
 def _get(name, factory):
@@ -332,13 +252,17 @@ def get_account_status() -> dict:
         equity  = mt5b.get_account_equity()
         balance = mt5b.get_account_balance()
         positions = mt5b.get_all_open_positions(_magic())
-    gov = _governor(equity)
-    booked = _book_closed_trades(gov)
+    with _acct().hold() as mine:
+        gov = _governor(equity)
+        booked = _book_closed_trades(gov) if mine else []
+        gstatus = gov.status
     return _jsonable({
         "equity": equity, "balance": balance,
         "newly_booked_closed_trades": booked,
         "open_positions": positions,
-        "governor": gov.status,
+        "governor": gstatus,
+        "bot": _bot_summary(),
+        "trading_paused": bool(bot_control.read_control().get("paused")),
         "limits": {"daily_loss_cap_pct": config.DAILY_LOSS_CAP_PCT,
                    "max_open_positions": config.MAX_OPEN_POSITIONS,
                    "max_orders_per_day": config.MAX_ORDERS_PER_DAY,
@@ -415,7 +339,10 @@ def get_recent_trades(count: int = 20) -> dict:
 
 # ── Trading tools ────────────────────────────────────────────────────────────
 
-def _plan(symbol: str, direction: str, size_multiplier: float) -> dict:
+def _plan(symbol: str, direction: str, size_multiplier: float, mine: bool = None) -> dict:
+    """mine: this server holds the account lock (call inside `_acct().hold()`)."""
+    if mine is None:
+        mine = _acct().held_here
     direction = direction.upper()
     if direction not in ("BUY", "SELL"):
         raise ValueError("direction must be BUY or SELL")
@@ -430,7 +357,17 @@ def _plan(symbol: str, direction: str, size_multiplier: float) -> dict:
     blockers = []
 
     gov = _governor(equity)
-    _book_closed_trades(gov)          # realised losses count before approving anything
+    if mine:
+        _book_closed_trades(gov)      # realised losses count before approving anything
+    else:
+        st = bot_control.bot_state()
+        blockers.append(
+            f"bot.py is running on this account (instance {st.get('instance') or '?'}) and does "
+            f"the trading: MCP orders are off while it runs (one trader per account). Use "
+            f"pause_trading / stop_bot, or close_position (carried out by the bot)."
+            if st["running"] else "The account is busy (another MCP server is trading). Try again.")
+    if bot_control.read_control().get("paused"):
+        blockers.append("Trading is paused (pause_trading). Call resume_trading to allow orders.")
     blackout, why = _calendar().is_blackout()
     ok, reason = gov.approve(current_equity=equity, open_position_count=len(positions),
                              sessions=ctx.get("sessions", []), is_blackout=blackout)
@@ -539,7 +476,8 @@ def preview_trade(symbol: str, direction: str, size_multiplier: float = 1.0) -> 
     blackout, duplicate and correlation guards, spread, setup blacklist, ML gate,
     Kelly, loss-streak and volatility sizing — and show the lot, stop loss, take
     profit and money at risk. Sends no order."""
-    plan = _plan(symbol, direction, size_multiplier)
+    with _acct().hold() as mine:
+        plan = _plan(symbol, direction, size_multiplier, mine)
     return _jsonable(plan)
 
 
@@ -555,13 +493,13 @@ def place_trade(symbol: str, direction: str, size_multiplier: float = 1.0,
     blocked = _trading_block_reason()
     if blocked:
         return {"placed": False, "error": blocked}
-    with _TRADE_LOCK:
-        return _place_locked(symbol, direction, size_multiplier, reason, confidence)
+    with _TRADE_LOCK, _acct().hold() as mine:     # [McpAcquire ... McpRelease]
+        return _place_locked(symbol, direction, size_multiplier, reason, confidence, mine)
 
 
 def _place_locked(symbol: str, direction: str, size_multiplier: float, reason: str,
-                  confidence: int = 0) -> dict:
-    plan = _plan(symbol, direction, size_multiplier)
+                  confidence: int = 0, mine: bool = None) -> dict:
+    plan = _plan(symbol, direction, size_multiplier, mine)
     ctx, gov = plan["_ctx"], plan["_gov"]
     if not plan["allowed"]:
         return _jsonable({"placed": False, **plan})
@@ -569,6 +507,8 @@ def _place_locked(symbol: str, direction: str, size_multiplier: float, reason: s
         return _jsonable({"placed": False, "dry_run": True,
                           "note": "Dry run: config.MCP_TRADING_MODE is not 'live'. No order sent.",
                           **plan})
+    if bot_control.read_control().get("paused"):            # [McpPlace: ~paused]
+        return _jsonable({"placed": False, "error": "Trading was paused just now (pause_trading)."})
     with _MT5_LOCK:
         result = mt5b.place_order(
             symbol=plan["symbol"], direction=plan["direction"], lot_size=plan["lot"],
@@ -623,21 +563,40 @@ def _place_locked(symbol: str, direction: str, size_multiplier: float, reason: s
 @server.tool(annotations=DESTRUCTIVE)
 def close_position(ticket: int) -> dict:
     """Close one of the bot's open positions by ticket (only positions with the
-    bot's magic number). Dry run unless config.MCP_TRADING_MODE = "live"."""
+    bot's magic number). Dry run unless config.MCP_TRADING_MODE = "live". While
+    bot.py runs, the bot carries out the close (one trader per account)."""
     blocked = _trading_block_reason()
     if blocked:
         return {"closed": False, "error": blocked}
     with _MT5_LOCK:
         _mt5_ready()
         pos = next((p for p in mt5b.get_all_open_positions(_magic()) if p["ticket"] == ticket), None)
-        if pos is None:
-            return {"closed": False, "error": f"No open bot position with ticket {ticket}."}
-        if _trading_mode() != "live":
-            return _jsonable({"closed": False, "dry_run": True, "position": pos,
-                              "note": "Dry run: config.MCP_TRADING_MODE is not 'live'."})
-        ok = mt5b.close_position(ticket, pos["symbol"], pos["volume"], pos["type"], magic=_magic())
-        equity = mt5b.get_account_equity()
-    booked = _book_closed_trades(_governor(equity)) if ok else []
+    if pos is None:
+        return {"closed": False, "error": f"No open bot position with ticket {ticket}."}
+    if _trading_mode() != "live":
+        return _jsonable({"closed": False, "dry_run": True, "position": pos,
+                          "note": "Dry run: config.MCP_TRADING_MODE is not 'live'."})
+    st = bot_control.bot_state()
+    if st["running"]:                                            # [RequestClose]
+        inst = st["instance"]
+        bot_control.request_close(inst, ticket)
+        done = bot_control.wait_for(
+            lambda s: s.get("instance") == inst and str(ticket) in (s.get("closes") or {}), 45)
+        if done is None:
+            return _jsonable({"closed": False, "requested": True, "position": pos,
+                              "note": "Close sent to the running bot; it hasn't confirmed yet "
+                                      "(it may be mid-tick). Check get_account_status shortly."})
+        res = done["closes"][str(ticket)]
+        return _jsonable({"closed": res == "closed", "by": f"bot.py {inst}", "result": res,
+                          "position": pos, "note": "The bot books the result on its next tick."})
+    with _acct().hold() as mine:                                  # [McpClose]
+        if not mine:
+            return {"closed": False, "error": "The account is busy (a bot is starting, or another "
+                                              "MCP server is trading). Try again."}
+        with _MT5_LOCK:
+            ok = mt5b.close_position(ticket, pos["symbol"], pos["volume"], pos["type"], magic=_magic())
+            equity = mt5b.get_account_equity()
+        booked = _book_closed_trades(_governor(equity)) if ok else []
     return _jsonable({"closed": bool(ok), "position": pos, "booked": booked})
 
 
@@ -664,7 +623,9 @@ def get_trades_to_review(count: int = 5) -> dict:
     """Closed trades waiting for a lesson (the review the bot's reflection agent does).
     For each: the result, the market state at entry and the reason given at entry.
     Write the lesson with save_lesson, or call it with should_save=false."""
-    booked = _book_closed_trades(_governor(mt5b_equity()))
+    equity = mt5b_equity()
+    with _acct().hold() as mine:
+        booked = _book_closed_trades(_governor(equity)) if mine else []
     out = []
     for r in _memory().pending_reviews(max(1, min(count, 20))):
         ctx = r.pop("entry_context", {}) or {}
@@ -722,6 +683,350 @@ def mt5b_equity() -> float:
     with _MT5_LOCK:
         _mt5_ready()
         return mt5b.get_account_equity()
+
+
+# ── Controlling bot.py (bot_control.py, specs/BotControl.tla) ────────────────
+
+SAFE_CONTROL = ToolAnnotations(read_only_hint=False, destructive_hint=False,
+                               idempotent_hint=True, open_world_hint=False)
+_CODE_DIR = os.path.dirname(os.path.abspath(__file__))
+_BOT_SCRIPT = os.path.join(_CODE_DIR, "bot.py")
+_CHILDREN: dict[int, subprocess.Popen] = {}        # bot / trainer processes started here
+_JOBS: dict[str, dict] = {}
+
+
+def _reap() -> None:
+    for pid, p in list(_CHILDREN.items()):
+        if p.poll() is not None:
+            _CHILDREN.pop(pid, None)
+
+
+def _tail(path: str, lines: int) -> list[str]:
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 256 * 1024))
+            data = f.read().decode("utf-8", errors="replace")
+        return data.splitlines()[-lines:]
+    except OSError:
+        return []
+
+
+def _bot_summary() -> dict:
+    _reap()
+    st = bot_control.bot_state()
+    s = st["status"]
+    out = {"running": st["running"]}
+    if st["running"]:
+        out.update({k: s.get(k) for k in ("instance", "pid", "mode", "started", "heartbeat",
+                                          "tick", "last_tick", "paused", "state")})
+        try:
+            hb = datetime_fromiso(s.get("heartbeat"))
+            out["seconds_since_heartbeat"] = round(time.time() - hb.timestamp(), 1)
+        except Exception:
+            pass
+    elif s.get("state"):
+        out["last_run"] = {k: s.get(k) for k in ("instance", "mode", "started", "stopped", "state")}
+    return out
+
+
+def datetime_fromiso(v):
+    from datetime import datetime
+    return datetime.fromisoformat(str(v))
+
+
+def _control_block_reason(loosening: bool) -> str | None:
+    """Actions that can start trading are refused over HTTP unless the owner allowed
+    it, and when MCP trading is off. Pausing / stopping is always allowed."""
+    if not loosening:
+        return None
+    if _trading_mode() == "off":
+        return "Trading tools are off (config.MCP_TRADING_MODE = 'off')."
+    if _STATE["transport"] == "http" and not getattr(config, "MCP_HTTP_ALLOW_TRADING", False):
+        return "Over HTTP this needs config.MCP_HTTP_ALLOW_TRADING = True."
+    return None
+
+
+def _spawn(args: list, log_path: str) -> subprocess.Popen:
+    """Start a child that keeps running after this MCP server exits."""
+    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+    logf = open(log_path, "ab")
+    env = dict(os.environ, PYTHONUNBUFFERED="1")
+    kw = dict(cwd=os.getcwd(), stdout=logf, stderr=subprocess.STDOUT,
+              stdin=subprocess.DEVNULL, env=env)
+    try:
+        if os.name == "nt":
+            flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+            try:   # leave the MCP client's job object, so closing the app doesn't kill it
+                p = subprocess.Popen(args, creationflags=flags | 0x01000000, **kw)
+            except OSError:
+                p = subprocess.Popen(args, creationflags=flags, **kw)
+        else:
+            p = subprocess.Popen(args, start_new_session=True, **kw)
+    finally:
+        logf.close()       # the child has its own handle
+    _CHILDREN[p.pid] = p
+    return p
+
+
+@server.tool(annotations=READ_ONLY)
+def bot_status() -> dict:
+    """Is bot.py running? Its instance id, pid, demo/live mode, last heartbeat and
+    tick, whether trading is paused, and the settings an MCP client has tightened."""
+    fv = bot_control._file_values(config)
+    ov = bot_control.read_overrides()
+    return _jsonable({
+        "bot": _bot_summary(),
+        "trading_paused": bool(bot_control.read_control().get("paused")),
+        "settings_overrides": {k: {"config_py": fv.get(k), "override": v,
+                                   "effective": bot_control.effective(k, fv.get(k), v)}
+                               for k, v in ov.items()},
+        "mcp_trading_mode": _trading_mode(),
+    })
+
+
+@server.tool(annotations=READ_ONLY)
+def get_bot_log(lines: int = 60, which: str = "bot") -> dict:
+    """The last lines of bot.py's log. which="bot" (bot.log) or "console"
+    (observability/bot_console.log: start-up errors, crashes)."""
+    lines = max(1, min(int(lines), 400))
+    path = "bot.log" if which != "console" else os.path.join("observability", "bot_console.log")
+    return {"file": path, "lines": _tail(path, lines)}
+
+
+@server.tool(annotations=DESTRUCTIVE)
+def start_bot(live: bool = False) -> dict:
+    """Start bot.py in the background (it keeps running if this app closes).
+    live=False (default) runs it with --demo: it analyses and logs trades but sends
+    no orders. live=True sends real orders and needs config.MCP_TRADING_MODE = "live"
+    (set by you in config.py; it can't be changed from here). bot.py needs its own
+    LLM key (config.LLM_API_KEY) for its agent desk."""
+    blocked = _control_block_reason(True)
+    if blocked:
+        return {"started": False, "error": blocked}
+    if live and _trading_mode() != "live":                      # [ACT-BC-7]
+        return {"started": False, "error": "Live needs config.MCP_TRADING_MODE = 'live' in "
+                                           "config.py (your decision; not settable from MCP)."}
+    st = bot_control.bot_state()
+    if st["running"]:
+        return _jsonable({"started": False, "error": "bot.py is already running.",
+                          "bot": _bot_summary()})
+    args = [bot_control.python_exe(), _BOT_SCRIPT] + ([] if live else ["--demo"])
+    console = os.path.join("observability", "bot_console.log")
+    p = _spawn(args, console)
+    ok = bot_control.wait_for(lambda s: s.get("pid") == p.pid and s.get("state") in
+                              ("starting", "running"), 45, interval=0.2)
+    if ok is None or p.poll() is not None:
+        return {"started": False, "exit_code": p.poll(),
+                "error": "bot.py did not start. Last console lines below.",
+                "console": _tail(console, 25)}
+    return _jsonable({"started": True, "mode": "live" if live else "demo", "pid": p.pid,
+                      "instance": ok.get("instance"),
+                      "note": "It now connects to MT5, loads memory and trains the ML gate; "
+                              "bot_status shows when it is ticking."})
+
+
+@server.tool(annotations=SAFE_CONTROL)
+def stop_bot(force: bool = False, wait_seconds: int = 30) -> dict:
+    """Stop the running bot.py. It finishes its current step and exits (open positions
+    stay open with their stop loss / take profit; a restarted bot adopts them).
+    force=True ends it immediately if it hasn't stopped within wait_seconds."""
+    st = bot_control.bot_state()
+    if not st["running"]:
+        return {"stopped": False, "error": "No bot.py is running."}
+    inst, pid = st["instance"], st["status"].get("pid")
+    bot_control.request_stop(inst)                              # [RequestStop: names the instance]
+    end = time.monotonic() + max(1, min(int(wait_seconds), 120))
+    while time.monotonic() < end:
+        _reap()
+        if not bot_control.pid_alive(pid):
+            return {"stopped": True, "how": "graceful", "instance": inst}
+        time.sleep(0.5)
+    if not force:
+        return {"stopped": False, "stop_requested": True, "instance": inst,
+                "note": "Still finishing its current step (an agent-desk round can take a "
+                        "while). Call bot_status later, or stop_bot(force=True)."}
+    cur = bot_control.read_status()
+    if cur.get("instance") != inst or cur.get("pid") != pid:     # [ForceKill: same instance only]
+        return {"stopped": True, "how": "graceful", "instance": inst}
+    killed = bot_control.kill_pid(pid)
+    _reap()
+    return {"stopped": killed, "how": "forced", "instance": inst}
+
+
+@server.tool(annotations=DESTRUCTIVE)
+def restart_bot(live: bool = False, force: bool = False) -> dict:
+    """Stop bot.py and start it again (e.g. to load new settings or a retrained model)."""
+    blocked = _control_block_reason(True)
+    if blocked:
+        return {"restarted": False, "error": blocked}
+    stopped = stop_bot(force=force)
+    if bot_control.bot_state()["running"]:
+        return {"restarted": False, "stop": stopped}
+    started = start_bot(live=live)
+    return {"restarted": bool(started.get("started")), "stop": stopped, "start": started}
+
+
+def _wait_ack(version: int, timeout: float = 30) -> bool:
+    st = bot_control.bot_state()
+    if not st["running"]:
+        return False
+    inst = st["instance"]
+    return bot_control.wait_for(lambda s: s.get("instance") == inst
+                                and int(s.get("control_version", -1)) >= version, timeout) is not None
+
+
+@server.tool(annotations=SAFE_CONTROL)
+def pause_trading() -> dict:
+    """Pause new trades — by bot.py and by MCP orders. Open positions keep being
+    managed (trailing stop, exits). Doesn't touch the daily-loss kill switch."""
+    c = bot_control.set_paused(True)                            # [SetPause(TRUE)]
+    running = bot_control.bot_state()["running"]
+    confirmed = _wait_ack(c["version"]) if running else None
+    return {"paused": True, "bot_running": running, "bot_confirmed": confirmed,
+            "note": ("The bot confirmed: it has no order in flight and won't send new ones."
+                     if confirmed else "The bot will apply it at its next check (every 2 s while "
+                     "idle, and before every order)." if running else "No bot running; MCP orders are paused.")}
+
+
+@server.tool(annotations=DESTRUCTIVE)
+def resume_trading() -> dict:
+    """Allow new trades again after pause_trading. The risk governor still applies:
+    this does NOT clear a daily-loss kill switch or drawdown halt (only the next day,
+    or you, can)."""
+    blocked = _control_block_reason(True)
+    if blocked:
+        return {"resumed": False, "error": blocked}
+    c = bot_control.set_paused(False)
+    running = bot_control.bot_state()["running"]
+    return {"resumed": True, "bot_running": running,
+            "bot_confirmed": _wait_ack(c["version"]) if running else None}
+
+
+@server.tool(annotations=READ_ONLY)
+def get_settings() -> dict:
+    """The limits an MCP client may change, with config.py's value, any override and
+    the value in use. Overrides can only make a limit stricter."""
+    fv = bot_control._file_values(config)
+    ov = bot_control.read_overrides()
+    rules = {"max": "can only be lowered", "min": "can only be raised",
+             "subset": "can only drop symbols"}
+    return _jsonable({k: {"config_py": fv.get(k), "override": ov.get(k),
+                          "in_use": bot_control.effective(k, fv.get(k), ov.get(k)),
+                          "rule": rules[spec[0]]}
+                      for k, spec in bot_control.TIGHTEN_ONLY.items()})
+
+
+@server.tool(annotations=SAFE_CONTROL)
+def update_settings(changes: dict) -> dict:
+    """Tighten limits, e.g. {"RISK_PER_TRADE_PCT": 0.25, "MAX_OPEN_POSITIONS": 2,
+    "SYMBOLS": ["EURUSD", "USDJPY"]}. Each value must be at least as strict as
+    config.py (see get_settings). The MCP server uses them at once; bot.py on its
+    next start (restart_bot)."""
+    res = bot_control.set_overrides(config, changes)
+    if res.get("saved"):                                        # [SetAiLimit]
+        bot_control.apply_overrides(config)
+        if bot_control.bot_state()["running"]:
+            res["note"] = "Saved. bot.py is running: call restart_bot to apply them to it."
+    return _jsonable(res)
+
+
+@server.tool(annotations=DESTRUCTIVE)
+def reset_settings(keys: list[str] | None = None) -> dict:
+    """Remove overrides (all, or the keys given): back to config.py's values."""
+    blocked = _control_block_reason(True)
+    if blocked:
+        return {"cleared": False, "error": blocked}
+    res = bot_control.clear_overrides(keys)                     # [ClearAiLimit]
+    bot_control.apply_overrides(config)
+    return _jsonable(res)
+
+
+@server.tool(annotations=SAFE_CONTROL)
+def retrain_ml_model() -> dict:
+    """Retrain the ML gate now from every closed trade and training sample in the
+    bot's memory (it also retrains on its own every META_RETRAIN_EVERY trades).
+    While bot.py runs, the bot retrains its own model."""
+    st = bot_control.bot_state()
+    if st["running"]:
+        inst = st["instance"]
+        _, seq = bot_control.request_retrain(inst)
+        done = bot_control.wait_for(lambda s: s.get("instance") == inst
+                                    and int(s.get("retrain_done", 0)) >= seq, 120)
+        if done is None:
+            return {"retrained": False, "requested": True,
+                    "note": "Sent to the running bot; it hasn't finished yet (mid-tick?)."}
+        return _jsonable({"retrained": True, "by": f"bot.py {inst}", **(done.get("retrain_result") or {})})
+    _lazy.pop("meta_gate", None)
+    g = _meta_gate()
+    return {"retrained": bool(getattr(g, "_trained", False)), "by": "MCP server",
+            "n_samples": getattr(g, "_n_samples", 0),
+            "note": "" if getattr(g, "_trained", False) else
+                    "Not enough training data yet: the gate uses its heuristic until it has enough."}
+
+
+_TRAINERS = {
+    "mt5_history":       "mt5_historical_trainer.py",
+    "tick_csv":          "csv_historical_trainer.py",
+    "trade_csv_lessons": "trainer.py",
+}
+
+
+@server.tool(annotations=SAFE_CONTROL)
+def run_training(kind: str, symbol: str = "", bars: int = 5000, max_samples: int = 500,
+                 path: str = "") -> dict:
+    """Run one of the bot's trainers in the background; returns a job_id for
+    get_training_job. kind:
+      "mt5_history"  ML-gate samples from MT5 price history (needs MT5; bars, max_samples, symbol)
+      "tick_csv"     ML-gate samples from MT5 tick-export CSVs in the folder `path`
+      "trade_csv_lessons"  lessons from a CSV of your past trades at `path` (uses the LLM key)
+    Then call retrain_ml_model so the gate uses the new samples."""
+    import re
+    import uuid
+    if kind not in _TRAINERS:
+        return {"started": False, "error": f"kind must be one of {list(_TRAINERS)}"}
+    for j in _JOBS.values():
+        if j["proc"].poll() is None:
+            return {"started": False, "error": f"Training job {j['id']} is still running."}
+    if symbol and not re.fullmatch(r"[A-Za-z0-9._#-]{3,20}", symbol):
+        return {"started": False, "error": "symbol looks invalid"}
+    bars, max_samples = max(100, min(int(bars), 100_000)), max(10, min(int(max_samples), 5000))
+    args = [bot_control.python_exe(), os.path.join(_CODE_DIR, _TRAINERS[kind])]
+    if kind == "mt5_history":
+        args += ["--bars", str(bars), "--max-samples", str(max_samples)]
+        if symbol:
+            args += ["--symbol", symbol]
+    elif kind == "tick_csv":
+        if not path or not os.path.isdir(path):
+            return {"started": False, "error": "path must be a folder with <SYMBOL>_TICK_*.csv files"}
+        args += ["--dir", path, "--max-samples", str(max_samples)] + (["--symbol", symbol] if symbol else [])
+    else:
+        if not path or not os.path.isfile(path):
+            return {"started": False, "error": "path must be a CSV file of past trades"}
+        if not getattr(config, "LLM_API_KEY", ""):
+            return {"started": False, "error": "trade_csv_lessons uses the LLM: set config.LLM_API_KEY"}
+        args += ["--file", path]
+    job_id = uuid.uuid4().hex[:8]
+    log_path = os.path.join("observability", "jobs", f"{job_id}.log")
+    p = _spawn(args, log_path)
+    _JOBS[job_id] = {"id": job_id, "kind": kind, "proc": p, "log": log_path,
+                     "started": time.strftime("%Y-%m-%d %H:%M:%S")}
+    return {"started": True, "job_id": job_id, "kind": kind}
+
+
+@server.tool(annotations=READ_ONLY)
+def get_training_job(job_id: str = "") -> dict:
+    """Status and last output lines of a training job (the latest if no job_id)."""
+    if not _JOBS:
+        return {"error": "No training job has been started by this server."}
+    j = _JOBS.get(job_id) or list(_JOBS.values())[-1]
+    code = j["proc"].poll()
+    out = {"job_id": j["id"], "kind": j["kind"], "started": j["started"],
+           "running": code is None, "exit_code": code, "output": _tail(j["log"], 30)}
+    if code == 0:
+        out["next"] = "Call retrain_ml_model so the ML gate uses the new samples."
+    return out
 
 
 # ── HTTP auth (ChatGPT supports OAuth or no auth — not API-key headers) ─────
