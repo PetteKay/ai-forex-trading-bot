@@ -1277,22 +1277,6 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                     ctx["cot_z_score"]   = _cot_signal.get("z_score", 0.0)
                     ctx["econ_surprise"] = _econ_signal.get("net_surprise", 0.0)
 
-                    log.info(f"[{symbol}] [5/5] Risk Manager...")
-                    risk_assessment = risk_mgr_agent.assess(
-                        ctx            = ctx,
-                        tech_analysis  = tech,
-                        bear_analysis  = bear,
-                        news_analysis  = macro,
-                        pm_decision    = pm,
-                        regime         = regime_info,
-                        cfg            = config,
-                    )
-                    log.info(
-                        f"  Qualified: {risk_assessment.get('trade_qualified')} | "
-                        f"Size: {risk_assessment.get('size_multiplier',1.0):.0%} | "
-                        f"Veto: {risk_assessment.get('veto_reason','none')}"
-                    )
-
                     # ── 11. Meta-label gate (24 features) ────────────────────
                     ml_result = meta_gate.predict(
                         fv, ctx,
@@ -1347,11 +1331,6 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                             _funnel["timing"] += 1
                             continue
 
-                    if not risk_assessment.get("trade_qualified", False):
-                        log.info(f"[{symbol}] Risk Manager VETOED: {risk_assessment.get('veto_reason')}")
-                        _funnel["risk_veto"] += 1
-                        continue
-
                     if not ml_pass:
                         log.info(
                             f"[{symbol}] Meta-label gate BLOCKED (prob={ml_prob:.3f} < {config.META_LABEL_MIN_PROB})"
@@ -1404,6 +1383,31 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                         # If we're at the max-positions limit, no point scanning more symbols
                         if open_count >= config.MAX_OPEN_POSITIONS:
                             break
+                        continue
+
+                    # ── Risk Manager LLM — only for trades that passed every free gate ──
+                    # All gates above are independent of the Risk Manager's answer, so
+                    # running them first gives the same decisions while skipping the
+                    # LLM call for HOLDs and blocked trades.
+                    log.info(f"[{symbol}] [5/5] Risk Manager...")
+                    risk_assessment = risk_mgr_agent.assess(
+                        ctx            = ctx,
+                        tech_analysis  = tech,
+                        bear_analysis  = bear,
+                        news_analysis  = macro,
+                        pm_decision    = pm,
+                        regime         = regime_info,
+                        cfg            = config,
+                    )
+                    log.info(
+                        f"  Qualified: {risk_assessment.get('trade_qualified')} | "
+                        f"Size: {risk_assessment.get('size_multiplier',1.0):.0%} | "
+                        f"Veto: {risk_assessment.get('veto_reason','none')}"
+                    )
+
+                    if not risk_assessment.get("trade_qualified", False):
+                        log.info(f"[{symbol}] Risk Manager VETOED: {risk_assessment.get('veto_reason')}")
+                        _funnel["risk_veto"] += 1
                         continue
 
                     # ── 14. Place order ───────────────────────────────────────
