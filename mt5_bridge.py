@@ -191,16 +191,23 @@ def get_risk_usd(symbol: str, entry_price: float, sl_price: float, volume: float
     return (abs(entry_price - sl_price) / pip_size) * pv
 
 
-def get_candles(symbol: str, timeframe: str, count: int = 200) -> pd.DataFrame:
+def get_candles(symbol: str, timeframe: str, count: int = 200,
+                include_forming: bool = False) -> pd.DataFrame:
     """
     Fetch the last `count` closed candles for a symbol.
     Returns a DataFrame with columns: time, open, high, low, close, volume
+
+    MT5 numbers bars from present to past and bar 0 is the current, still-forming
+    bar (MQL5 docs: copy_rates_from_pos / CopyRates). Starting at 1 returns only
+    closed bars, so signals do not change while the candle is still forming.
+    Pass include_forming=True only when the live bar is wanted on purpose.
     """
     tf = TIMEFRAME_MAP.get(timeframe.upper())
     if tf is None:
         raise ValueError(f"Unknown timeframe: {timeframe}")
 
-    rates = mt5.copy_rates_from_pos(symbol, tf, 0, count)
+    start_pos = 0 if include_forming else 1
+    rates = mt5.copy_rates_from_pos(symbol, tf, start_pos, count)
     if rates is None or len(rates) == 0:
         raise RuntimeError(f"No candle data for {symbol}: {mt5.last_error()}")
 
@@ -246,9 +253,35 @@ def get_all_open_positions(magic: int) -> list[dict]:
             "sl":     p.sl,
             "tp":     p.tp,
             "profit": p.profit,
+            "time":   int(getattr(p, "time", 0) or 0),   # open time, terminal timebase
         }
         for p in positions if p.magic == magic
     ]
+
+
+def terminal_time_to_utc(ts: int, symbol: str, now_utc=None):
+    """
+    Convert a position/deal timestamp from the terminal's timebase to UTC.
+
+    MQL5 forum answers disagree on whether these timestamps are UTC or broker
+    server time, so the offset is MEASURED instead of assumed: the symbol's
+    latest tick time minus the real UTC clock, rounded to the nearest 30 min
+    (≈0 if the terminal already uses UTC). If the tick is stale (market closed),
+    the gap is not close to a 30-min multiple and None is returned.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+    if not ts:
+        return None
+    now_utc = now_utc or _dt.now(_tz.utc)
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None or not getattr(tick, "time", 0):
+        return None
+    raw     = float(tick.time) - now_utc.timestamp()
+    offset  = round(raw / 1800.0) * 1800.0
+    if abs(raw - offset) > 300:          # tick older than 5 min → can't measure
+        return None
+    dt = _dt.fromtimestamp(ts - offset, tz=_tz.utc)
+    return min(dt, now_utc)
 
 
 def get_unrealised_pnl(symbol: str, magic: int) -> float:
@@ -534,6 +567,14 @@ def is_connected() -> bool:
         return info is not None and info.connected
     except Exception:
         return False
+
+
+def get_live_price(symbol: str) -> float | None:
+    """Current bid (the price MT5 bars are built from), or None if no tick."""
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None or not getattr(tick, "bid", 0):
+        return None
+    return float(tick.bid)
 
 
 def get_spread_pips(symbol: str) -> float:

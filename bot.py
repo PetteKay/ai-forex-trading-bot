@@ -31,6 +31,9 @@ import json
 import os
 import sys
 from datetime import datetime, UTC
+from strategy.position_sizing import compute_lot, kelly_fraction
+from agents.desk import run_desk
+from strategy.bar_gate import BarGate
 
 # Fix Windows console encoding so Unicode box-drawing chars don't crash the logger
 if hasattr(sys.stdout, "reconfigure"):
@@ -53,6 +56,14 @@ from agents import technical_analyst, portfolio_manager, reflection
 from agents import bear as bear_analyst
 from agents import news_analyst
 from agents import risk_manager as risk_mgr_agent
+
+# LLM agents used by the parallel agent desk (agents/desk.py)
+_DESK_AGENTS = {
+    "technical":         technical_analyst,
+    "bear":              bear_analyst,
+    "news":              news_analyst,
+    "portfolio_manager": portfolio_manager,
+}
 from data.news_feed import fetch_headlines
 try:
     from data.macro_context import get_macro_context, macro_summary_for_llm
@@ -189,7 +200,7 @@ def classify_outcome(r_multiple: float) -> str:
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
-def run(demo_mode: bool = False):
+def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
     # Build watch list — use SYMBOLS if set, else fall back to single SYMBOL
     symbols_config = getattr(config, "SYMBOLS", None) or [config.SYMBOL]
 
@@ -262,7 +273,18 @@ def run(demo_mode: bool = False):
         max_orders_per_day   = config.MAX_ORDERS_PER_DAY,
         max_drawdown_pct     = config.MAX_DRAWDOWN_PCT,
         allowed_sessions     = config.ALLOWED_SESSIONS,
+        state_path           = getattr(config, "GOVERNOR_STATE_PATH", "observability/governor_state.json"),
     )
+    if reset_drawdown_halt:
+        governor.reset_drawdown_halt(starting_equity)
+
+    if (getattr(config, "SIZING_MODE", "fixed") == "fixed"
+            and compute_lot("fixed", 0.5, base_lot=config.LOT_SIZE)[0] >= config.LOT_SIZE):
+        log.warning(
+            f"Sizing: SIZING_MODE='fixed' with LOT_SIZE={config.LOT_SIZE} — size "
+            f"adjustments (Kelly, HMM, volatility, loss streak) cannot reduce the lot. "
+            f"Use SIZING_MODE='risk_pct' or a larger LOT_SIZE for them to take effect."
+        )
     calendar      = EconomicCalendar(
         blackout_before_min = config.CALENDAR_BLACKOUT_BEFORE_MIN,
         blackout_after_min  = config.CALENDAR_BLACKOUT_AFTER_MIN,
@@ -279,6 +301,11 @@ def run(demo_mode: bool = False):
         max_bars_between=getattr(config, "CUSUM_MAX_BARS", 20),
         min_bars_between=getattr(config, "CUSUM_MIN_BARS", 3),
     ) if _CUSUM_AVAILABLE else None
+
+    # New-candle gate — the agent desk runs once per new closed candle per symbol
+    _bar_gate = BarGate()
+    # CUSUM decision cached per candle so its state advances once per candle
+    _cusum_bar: dict[str, tuple] = {}
 
     # HMM latent vol regime model — retrained daily alongside LightGBM
     _hmm_model    = HMMRegimeModel() if _HMM_AVAILABLE else None
@@ -306,6 +333,15 @@ def run(demo_mode: bool = False):
     _existing = mt5b.get_all_open_positions(config.MAGIC_NUMBER)
     for _pos in _existing:
         _ticket = _pos["ticket"]
+        # Real open time from MT5, so the max-hold time exit keeps counting from
+        # the actual entry instead of restarting at every bot restart.
+        try:
+            _opened = mt5b.terminal_time_to_utc(_pos.get("time", 0), _pos["symbol"])
+        except Exception:
+            _opened = None
+        if _opened is None:
+            log.warning(f"[{_pos['symbol']}] ticket {_ticket}: open time unavailable "
+                        f"(market closed?) — using now; max-hold clock restarts.")
         if _ticket not in open_trades:
             open_trades[_ticket] = OpenTradeRecord(
                 ticket        = _ticket,
@@ -315,7 +351,7 @@ def run(demo_mode: bool = False):
                 entry_context = {},
                 tech_analysis = {},
                 pm_decision   = {},
-                entry_time    = datetime.now(UTC),  # best available; exact time unknown
+                entry_time    = _opened or datetime.now(UTC),
                 atr           = 0.0,
                 sl            = _pos["sl"],
                 tp            = _pos["tp"],
@@ -386,18 +422,10 @@ def run(demo_mode: bool = False):
                 f"Unrealised: {unrealised:+.2f} | Governor: {governor.status}"
             )
 
-            # ── Kill-switch guard ─────────────────────────────────────────
-            gov_status = governor.status
-            if gov_status["kill_active"] or gov_status["drawdown_halt"]:
-                halt_reason = "kill switch" if gov_status["kill_active"] else "drawdown halt"
-                if open_trades and not demo_mode:
-                    log.warning(f"Governor {halt_reason} ACTIVE — force-closing all open positions.")
-                    pos_manager.close_all(open_trades, config)
-                log.info(f"Governor {halt_reason} — skipping agent desk and sleeping.")
-                _sleep(tick_start)
-                continue
-
             # ── 3. Detect closed trades → get real P&L → reflect ─────────
+            # Runs BEFORE the kill-switch guard so trades closed by the kill switch
+            # (or by SL/TP while it is active) still have their real P&L recorded
+            # in the governor, journal and memory.
             closed_tickets = set(open_trades.keys()) - current_tickets
             for ticket in closed_tickets:
                 record    = open_trades.pop(ticket)
@@ -496,52 +524,95 @@ def run(demo_mode: bool = False):
                     pm_decision        = record.pm_decision,
                     cfg                = config,
                 )
+                _rc_entry = record.entry_context.get("regime", {})
+                _regime_entry = _rc_entry.get("regime", "") if isinstance(_rc_entry, dict) else ""
+                _entry_iso = (record.entry_time.isoformat()
+                              if hasattr(record.entry_time, "isoformat") else str(record.entry_time))
+                _exit_iso  = datetime.now(UTC).isoformat()
+
                 if lesson_record:
                     lesson_record["feature_vector"] = feature_vector(record.entry_context)
                     lesson_record["r_multiple"]     = r_multiple
-                    _rc = record.entry_context.get("regime", {})
-                    lesson_record["regime"] = _rc.get("regime", "") if isinstance(_rc, dict) else ""
-                    # Store Tier 1 signal context for 24-feature ML training
+                    lesson_record["regime"]         = _regime_entry
+                    # Store Tier 1 signal context for ML training
                     lesson_record["fib_proximity"] = record.entry_context.get("fib_proximity", 0.0)
                     lesson_record["cot_z_score"]   = record.entry_context.get("cot_z_score", 0.0)
                     lesson_record["econ_surprise"]  = record.entry_context.get("econ_surprise", 0.0)
+                    lesson_record["entry_time"]     = _entry_iso
+                    # This trade's training row lives in ml_samples (below), so the
+                    # memory copy is excluded from training to avoid counting it twice.
+                    lesson_record["ml_sampled"]     = 1 if record.entry_context else 0
                     saved = memory.save(lesson_record)
                     if saved:
                         log.info(f"★ [{sym}] Lesson saved: {lesson_record['lesson'][:100]}")
-                        # SGD online update — immediate single-trade adaptation
-                        try:
-                            _fv_ol = feature_vector(record.entry_context)
-                            _rc_ol = record.entry_context.get("regime", {})
-                            _re_ol = _rc_ol.get("regime", "") if isinstance(_rc_ol, dict) else ""
-                            meta_gate.online_update(
-                                feature_vector = _fv_ol,
-                                is_win         = net_pnl > 0,
-                                regime_str     = _re_ol,
-                                fib_proximity  = record.entry_context.get("fib_proximity", 0.0),
-                                cot_z_score    = record.entry_context.get("cot_z_score", 0.0),
-                                econ_surprise  = record.entry_context.get("econ_surprise", 0.0),
-                            )
-                        except Exception as _ol_err:
-                            log.debug(f"Online update error: {_ol_err}")
-                        memories_since_retrain += 1
-                        if memories_since_retrain >= config.META_RETRAIN_EVERY:
-                            all_m = memory.get_all_for_training()
-                            meta_gate.train(all_m, training_lookback_days=getattr(config, "ML_TRAINING_LOOKBACK_DAYS", 180))
-                            memories_since_retrain = 0
 
-                            # Walk-forward: adapt confidence threshold based on recent results
-                            if (_ADAPTIVE_PARAMS_AVAILABLE
-                                    and getattr(config, "ADAPTIVE_CONFIDENCE_ENABLED", False)):
-                                _new_conf, _conf_reason = compute_adaptive_confidence(
-                                    db_path           = config.JOURNAL_DB_PATH,
-                                    lookback_trades   = getattr(config, "ADAPTIVE_CONFIDENCE_LOOKBACK", 30),
-                                    current_threshold = _dynamic_min_confidence,
-                                )
-                                if _new_conf != _dynamic_min_confidence:
-                                    log.info(f"AdaptiveConf: {_conf_reason}")
-                                    _dynamic_min_confidence = _new_conf
-                                else:
-                                    log.debug(f"AdaptiveConf: {_conf_reason}")
+                # ── ML training data: EVERY closed trade, not only saved lessons ──
+                # Training only on lessons the reflection LLM chose to keep (and that
+                # survived usefulness pruning) biased the meta-label model's data.
+                # Adopted positions (no entry context) have no features to learn from.
+                if record.entry_context:
+                    try:
+                        memory.save_ml_sample({
+                            "ticket":         ticket,
+                            "symbol":         sym,
+                            "direction":      record.direction,
+                            "entry_time":     _entry_iso,
+                            "exit_time":      _exit_iso,
+                            "feature_vector": feature_vector(record.entry_context),
+                            "regime":         _regime_entry,
+                            "fib_proximity":  record.entry_context.get("fib_proximity", 0.0),
+                            "cot_z_score":    record.entry_context.get("cot_z_score", 0.0),
+                            "econ_surprise":  record.entry_context.get("econ_surprise", 0.0),
+                            "r_multiple":     r_multiple,
+                            "pnl_pct":        pnl_pct,
+                            "outcome":        outcome,
+                        })
+                    except Exception as _ms_err:
+                        log.warning(f"[{sym}] Could not store ML sample: {_ms_err}")
+                    # SGD online update — immediate single-trade adaptation
+                    try:
+                        meta_gate.online_update(
+                            feature_vector = feature_vector(record.entry_context),
+                            is_win         = net_pnl > 0,
+                            regime_str     = _regime_entry,
+                            fib_proximity  = record.entry_context.get("fib_proximity", 0.0),
+                            cot_z_score    = record.entry_context.get("cot_z_score", 0.0),
+                            econ_surprise  = record.entry_context.get("econ_surprise", 0.0),
+                            direction      = record.direction,
+                            entry_time     = record.entry_time,
+                        )
+                    except Exception as _ol_err:
+                        log.debug(f"Online update error: {_ol_err}")
+                    memories_since_retrain += 1
+                    if memories_since_retrain >= config.META_RETRAIN_EVERY:
+                        all_m = memory.get_all_for_training()
+                        meta_gate.train(all_m, training_lookback_days=getattr(config, "ML_TRAINING_LOOKBACK_DAYS", 180))
+                        memories_since_retrain = 0
+
+                        # Walk-forward: adapt confidence threshold based on recent results
+                        if (_ADAPTIVE_PARAMS_AVAILABLE
+                                and getattr(config, "ADAPTIVE_CONFIDENCE_ENABLED", False)):
+                            _new_conf, _conf_reason = compute_adaptive_confidence(
+                                db_path           = config.JOURNAL_DB_PATH,
+                                lookback_trades   = getattr(config, "ADAPTIVE_CONFIDENCE_LOOKBACK", 30),
+                                current_threshold = _dynamic_min_confidence,
+                            )
+                            if _new_conf != _dynamic_min_confidence:
+                                log.info(f"AdaptiveConf: {_conf_reason}")
+                                _dynamic_min_confidence = _new_conf
+                            else:
+                                log.debug(f"AdaptiveConf: {_conf_reason}")
+
+            # ── Kill-switch guard ─────────────────────────────────────────
+            gov_status = governor.status
+            if gov_status["kill_active"] or gov_status["drawdown_halt"]:
+                halt_reason = "kill switch" if gov_status["kill_active"] else "drawdown halt"
+                if open_trades and not demo_mode:
+                    log.warning(f"Governor {halt_reason} ACTIVE — force-closing all open positions.")
+                    pos_manager.close_all(open_trades, config)
+                log.info(f"Governor {halt_reason} — skipping agent desk and sleeping.")
+                _sleep(tick_start)
+                continue
 
             # ── 4. Active position management (trailing SL etc.) ─────────
             if open_trades and not demo_mode:
@@ -591,6 +662,8 @@ def run(demo_mode: bool = False):
                 "duplicate": 0, "correlation": 0, "governor": 0, "placed": 0,
             }
 
+            # Stage 1 (main thread): data, filters, memory recall — all MT5 calls.
+            _jobs: list[dict] = []
             for symbol in symbols_list:
                 _funnel["scanned"] += 1
 
@@ -615,6 +688,24 @@ def run(demo_mode: bool = False):
                     if not ctx:
                         log.warning(f"[{symbol}] Not enough candle data.")
                         continue
+
+                    # ── 5b. New-candle gate ───────────────────────────────────
+                    # Signals use closed candles; until a new one closes there is
+                    # nothing new for the agent desk to evaluate.
+                    _bar_t = df["time"].iloc[-1] if "time" in df.columns else df.index[-1]
+                    if (getattr(config, "EVALUATE_ON_NEW_BAR_ONLY", True)
+                            and _bar_gate.already_evaluated(symbol, _bar_t)):
+                        _funnel["same_candle"] = _funnel.get("same_candle", 0) + 1
+                        continue
+
+                    # Signals come from closed candles; level-proximity checks
+                    # (S/R zones, pivots, key levels) use the live price, as they
+                    # did when the forming candle's close was the "price".
+                    try:
+                        _lp = mt5b.get_live_price(symbol)
+                    except Exception:
+                        _lp = None
+                    ctx["live_price"] = _lp or ctx["price"]
 
                     # ── 6. Regime classification ──────────────────────────────
                     regime_info = classify_regime(ctx["_df"], ctx["atr_percentile"])
@@ -684,7 +775,11 @@ def run(demo_mode: bool = False):
                         pass
 
                     if _cusum is not None and not getattr(config, "CUSUM_DISABLED", False):
-                        if not _cusum.should_evaluate(symbol, float(ctx.get("price", 0)), _atr_pct):
+                        # Advance CUSUM once per closed candle (its "bars" are candles).
+                        if _cusum_bar.get(symbol, (None,))[0] != _bar_t:
+                            _cusum_bar[symbol] = (_bar_t, _cusum.should_evaluate(
+                                symbol, float(ctx.get("price", 0)), _atr_pct))
+                        if not _cusum_bar[symbol][1]:
                             _funnel["cusum"] = _funnel.get("cusum", 0) + 1
                             continue
 
@@ -733,7 +828,7 @@ def run(demo_mode: bool = False):
                     if _SR_ZONES_AVAILABLE and getattr(config, "SR_ZONE_ENABLED", False):
                         try:
                             _sr_zones  = find_sr_zones(symbol, ctx["_df"])
-                            _sr_result = check_sr_zone(symbol, ctx["price"], _sr_zones)
+                            _sr_result = check_sr_zone(symbol, ctx["live_price"], _sr_zones)
                             if _sr_result["at_sr_zone"]:
                                 log.info(
                                     f"  SR Zone [{symbol}]: {_sr_result['zone_type']} @ "
@@ -758,7 +853,7 @@ def run(demo_mode: bool = False):
                     _pivot_result = {"at_pivot": False}
                     if _PIVOT_LEVELS_AVAILABLE and getattr(config, "PIVOT_LEVELS_ENABLED", False):
                         try:
-                            _pivot_result = check_pivot_levels(symbol, ctx["price"], ctx["_df"])
+                            _pivot_result = check_pivot_levels(symbol, ctx["live_price"], ctx["_df"])
                             if _pivot_result["at_pivot"]:
                                 log.info(
                                     f"  Pivot [{symbol}]: {_pivot_result['pivot_type']} "
@@ -856,92 +951,84 @@ def run(demo_mode: bool = False):
                             except Exception as _hmm_pe:
                                 log.debug(f"HMM predict error: {_hmm_pe}")
 
-                    # ── 10. Run 5-agent desk ──────────────────────────────────
-                    log.info(f"[{symbol}] ─── Agent Desk ───")
+                    # ── 10. Queue the agent desk ──────────────────────────────
+                    # The desk (LLM calls only) runs below on worker threads, several
+                    # symbols at once. Everything above stays on the main thread.
+                    _next_ev = calendar.next_event()
+                    _bar_gate.mark(symbol, _bar_t)
+                    _jobs.append({
+                        "symbol":          symbol,
+                        "ctx":             ctx,
+                        "regime_info":     regime_info,
+                        "memories":        memories,
+                        "agent_accuracy":  _agent_acc,
+                        "upcoming_events": [_next_ev] if _next_ev else [],
+                        "extra_signals": {
+                            "cot_signal":           _cot_signal.get("signal", "NEUTRAL"),
+                            "econ_surprise_signal": _econ_signal.get("signal", "NEUTRAL"),
+                            "fib_label":            "",   # filled after the key-level check
+                            "sr_zone_type":         _sr_result.get("zone_type", ""),
+                            "sr_zone_strength":     _sr_result.get("zone_strength", 0.0),
+                        },
+                        # used after the desk (stage 3)
+                        "m15_df": m15_df, "fp": fp, "fv": fv,
+                        "_cot_signal": _cot_signal, "_econ_signal": _econ_signal,
+                        "_sr_result": _sr_result, "_pivot_result": _pivot_result,
+                        "_sl_base_mult": _sl_base_mult, "_tp_base_mult": _tp_base_mult,
+                        "_bear_veto": _bear_veto,
+                    })
 
-                    log.info(f"[{symbol}] [1/5] Technical Analyst...")
-                    tech = technical_analyst.analyse(ctx, config)
-                    log.info(
-                        f"  Bull: {tech.get('bias','?')} ({tech.get('bias_strength','?')}/10) | "
-                        f"{tech.get('summary','')[:80]}"
+                except Exception as _sym_err:
+                    # Error boundary: one symbol failing must never kill the whole
+                    # trading loop — log it, count it, move to the next symbol.
+                    _funnel["error"] = _funnel.get("error", 0) + 1
+                    log.error(
+                        f"[{symbol}] Unhandled error in symbol scan — skipping this symbol: {_sym_err}",
+                        exc_info=True,
                     )
+                    continue
 
-                    # Prepare news inputs before parallel execution
-                    next_event     = calendar.next_event()
-                    upcoming_list  = [next_event] if next_event else []
-                    live_headlines = fetch_headlines(symbol)
-                    if live_headlines:
-                        log.info(f"  Live headlines: {len(live_headlines)} | Top: {live_headlines[0][:80]}")
-                    live_macro = {}
-                    if _MACRO_AVAILABLE:
-                        try:
-                            live_macro = get_macro_context(symbol)
-                            log.info(
-                                f"  Live macro: VIX={live_macro.get('vix','?')} "
-                                f"[{live_macro.get('vix_regime','?')}] | "
-                                f"DXY={live_macro.get('dxy','?')} [{live_macro.get('dxy_trend','?')}] | "
-                                f"F&G={live_macro.get('fear_greed_score','?')}"
-                            )
-                        except Exception as _me:
-                            log.debug(f"Macro fetch skipped: {_me}")
+            # Stage 2 (worker threads): agent desks — LLM calls only, no MT5.
+            _desk_workers = max(1, int(getattr(config, "DESK_PARALLELISM", 3)))
+            _desk_pool = ThreadPoolExecutor(max_workers=_desk_workers, thread_name_prefix="desk")
+            _desk_futs = [
+                _desk_pool.submit(
+                    run_desk, _job, config, _DESK_AGENTS, fetch_headlines,
+                    get_macro_context if _MACRO_AVAILABLE else None,
+                )
+                for _job in _jobs
+            ]
+            if _jobs:
+                log.info(f"Agent desks: {len(_jobs)} symbol(s), {_desk_workers} at a time")
 
-                    log.info(f"[{symbol}] [2+3/5] Bear + News Analysts (parallel)...")
-                    with ThreadPoolExecutor(max_workers=2) as _pool:
-                        _bear_fut = _pool.submit(bear_analyst.analyse, ctx, tech, config)
-                        _news_fut = _pool.submit(lambda: news_analyst.analyse(
-                            symbol          = symbol,
-                            sessions        = ctx.get("sessions", []),
-                            upcoming_events = upcoming_list,
-                            cfg             = config,
-                            news_snippets   = live_headlines or None,
-                            macro           = live_macro or None,
-                        ))
-                        try:
-                            bear = _bear_fut.result()
-                        except Exception as _be:
-                            log.warning(f"[{symbol}] Bear analyst failed: {_be} — using safe default")
-                            bear = {"bear_thesis": "Analysis unavailable.", "risk_score": 5,
-                                    "evidence": [], "counter_to_bull": "Unknown", "regime_warning": ""}
-                        try:
-                            macro = _news_fut.result()
-                        except Exception as _ne:
-                            log.warning(f"[{symbol}] News analyst failed: {_ne} — using safe default")
-                            macro = {"macro_tone": "NEUTRAL", "news_risk": 5, "key_themes": [],
-                                     "session_bias": "NEUTRAL", "recommendation": "HOLD"}
+            # Stage 3 (main thread, original symbol order): adjustments, gates,
+            # Risk Manager, sizing, orders.
+            for _job, _desk_fut in zip(_jobs, _desk_futs):
+                symbol = _job["symbol"]
+                try:
+                    ctx           = _job["ctx"]
+                    regime_info   = _job["regime_info"]
+                    m15_df        = _job["m15_df"]
+                    fp, fv        = _job["fp"], _job["fv"]
+                    _cot_signal   = _job["_cot_signal"]
+                    _econ_signal  = _job["_econ_signal"]
+                    _sr_result    = _job["_sr_result"]
+                    _pivot_result = _job["_pivot_result"]
+                    _sl_base_mult = _job["_sl_base_mult"]
+                    _tp_base_mult = _job["_tp_base_mult"]
+                    _bear_veto    = _job["_bear_veto"]
+                    _extra_signals_for_pm = _job["extra_signals"]
 
-                    log.info(
-                        f"  Bear risk: {bear.get('risk_score','?')}/10 | "
-                        f"{bear.get('bear_thesis','')[:80]}"
-                    )
-                    log.info(
-                        f"  Macro: {macro.get('macro_tone','?')} | "
-                        f"News risk: {macro.get('news_risk','?')} | "
-                        f"DXY impact: {macro.get('dxy_impact','?')[:60]}"
-                    )
-
-                    log.info(f"[{symbol}] [4/5] Fund Manager (arbitrates bull vs bear)...")
-                    _extra_signals_for_pm = {
-                        "cot_signal":           _cot_signal.get("signal", "NEUTRAL"),
-                        "econ_surprise_signal": _econ_signal.get("signal", "NEUTRAL"),
-                        "fib_label":            "",   # filled below after key_level check
-                        "sr_zone_type":         _sr_result.get("zone_type", ""),
-                        "sr_zone_strength":     _sr_result.get("zone_strength", 0.0),
-                    }
-                    pm = portfolio_manager.decide(
-                        technical_analysis = tech,
-                        bear_analysis      = bear,
-                        news_analysis      = macro,
-                        past_memories      = memories,
-                        ctx                = ctx,
-                        regime             = regime_info,
-                        cfg                = config,
-                        agent_accuracy     = _agent_acc,
-                        extra_signals      = _extra_signals_for_pm,
-                    )
+                    _desk      = _desk_fut.result()
+                    tech       = _desk["tech"]
+                    bear       = _desk["bear"]
+                    macro      = _desk["macro"]
+                    pm         = _desk["pm"]
+                    live_macro = _desk["live_macro"]
                     action     = pm.get("action", "HOLD")
                     confidence = pm.get("confidence", 0)
                     log.info(
-                        f"  Decision: {action} ({confidence}%) | "
+                        f"[{symbol}]   Decision: {action} ({confidence}%) | "
                         f"Verdict: {pm.get('bull_bear_verdict','?')} | "
                         f"{pm.get('reasoning','')[:100]}"
                     )
@@ -960,7 +1047,7 @@ def run(demo_mode: bool = False):
                             and getattr(config, "KEY_LEVEL_CHECK_ENABLED", False)
                             and action in ("BUY", "SELL")):
                         try:
-                            kl = check_key_levels(symbol, ctx["price"], ctx["_df"])
+                            kl = check_key_levels(symbol, ctx["live_price"], ctx["_df"])
                             if kl["at_key_level"]:
                                 aligned = (
                                     (action == "BUY"  and kl["signal_alignment"] == "SUPPORT") or
@@ -1212,28 +1299,13 @@ def run(demo_mode: bool = False):
                     ctx["cot_z_score"]   = _cot_signal.get("z_score", 0.0)
                     ctx["econ_surprise"] = _econ_signal.get("net_surprise", 0.0)
 
-                    log.info(f"[{symbol}] [5/5] Risk Manager...")
-                    risk_assessment = risk_mgr_agent.assess(
-                        ctx            = ctx,
-                        tech_analysis  = tech,
-                        bear_analysis  = bear,
-                        news_analysis  = macro,
-                        pm_decision    = pm,
-                        regime         = regime_info,
-                        cfg            = config,
-                    )
-                    log.info(
-                        f"  Qualified: {risk_assessment.get('trade_qualified')} | "
-                        f"Size: {risk_assessment.get('size_multiplier',1.0):.0%} | "
-                        f"Veto: {risk_assessment.get('veto_reason','none')}"
-                    )
-
                     # ── 11. Meta-label gate (24 features) ────────────────────
                     ml_result = meta_gate.predict(
                         fv, ctx,
                         fib_proximity = ctx.get("fib_proximity", 0.0),
                         cot_z_score   = ctx.get("cot_z_score", 0.0),
                         econ_surprise = ctx.get("econ_surprise", 0.0),
+                        direction     = action,
                     )
                     ml_prob   = ml_result["probability"]
                     ml_pass   = meta_gate.should_trade(ml_prob, config.META_LABEL_MIN_PROB)
@@ -1277,14 +1349,10 @@ def run(demo_mode: bool = False):
                         timing = check_entry_timing(m15_df, action, ctx.get("atr", 0.001))
                         log.info(f"  M15 timing: {timing['decision']} (quality={timing['quality']:.2f}) | {timing['reason']}")
                         if timing["decision"] == "WAIT":
+                            _bar_gate.retry(symbol)   # keep the old "re-evaluate next tick"
                             log.info(f"[{symbol}] M15 says WAIT — skipping this tick, re-evaluates next.")
                             _funnel["timing"] += 1
                             continue
-
-                    if not risk_assessment.get("trade_qualified", False):
-                        log.info(f"[{symbol}] Risk Manager VETOED: {risk_assessment.get('veto_reason')}")
-                        _funnel["risk_veto"] += 1
-                        continue
 
                     if not ml_pass:
                         log.info(
@@ -1340,6 +1408,31 @@ def run(demo_mode: bool = False):
                             break
                         continue
 
+                    # ── Risk Manager LLM — only for trades that passed every free gate ──
+                    # All gates above are independent of the Risk Manager's answer, so
+                    # running them first gives the same decisions while skipping the
+                    # LLM call for HOLDs and blocked trades.
+                    log.info(f"[{symbol}] [5/5] Risk Manager...")
+                    risk_assessment = risk_mgr_agent.assess(
+                        ctx            = ctx,
+                        tech_analysis  = tech,
+                        bear_analysis  = bear,
+                        news_analysis  = macro,
+                        pm_decision    = pm,
+                        regime         = regime_info,
+                        cfg            = config,
+                    )
+                    log.info(
+                        f"  Qualified: {risk_assessment.get('trade_qualified')} | "
+                        f"Size: {risk_assessment.get('size_multiplier',1.0):.0%} | "
+                        f"Veto: {risk_assessment.get('veto_reason','none')}"
+                    )
+
+                    if not risk_assessment.get("trade_qualified", False):
+                        log.info(f"[{symbol}] Risk Manager VETOED: {risk_assessment.get('veto_reason')}")
+                        _funnel["risk_veto"] += 1
+                        continue
+
                     # ── 14. Place order ───────────────────────────────────────
                     import MetaTrader5 as mt5
                     sym_info = mt5.symbol_info(symbol)
@@ -1370,12 +1463,17 @@ def run(demo_mode: bool = False):
                         # Payoff must match the ACTUAL trade geometry (symbol-specific
                         # TP mult / adaptive SL mult), not the global config defaults.
                         payoff_b = _tp_base_mult / _sl_mult if _sl_mult > 0 else config.ATR_TP_MULT / config.ATR_SL_MULT
-                        kelly_f  = (ml_p * payoff_b - (1.0 - ml_p)) / payoff_b
-                        kelly_f  = max(0.0, kelly_f)
-                        frac_k   = kelly_f * getattr(config, "KELLY_FRACTION", 0.25)
-                        size_mult = min(size_mult, frac_k) if frac_k > 0 else size_mult
+                        frac_k   = kelly_fraction(ml_p, payoff_b, getattr(config, "KELLY_FRACTION", 0.25))
+                        if frac_k <= 0:
+                            # Kelly says no edge at these odds. Previously this kept
+                            # the FULL size; now it means no trade.
+                            log.info(
+                                f"[{symbol}] ¼-Kelly: p={ml_p:.3f}, b={payoff_b:.2f} → no edge. Skipping."
+                            )
+                            continue
+                        size_mult = min(size_mult, frac_k)
                         log.info(
-                            f"¼-Kelly: p={ml_p:.3f}, b={payoff_b:.2f} → kelly={kelly_f:.3f} → "
+                            f"¼-Kelly: p={ml_p:.3f}, b={payoff_b:.2f} → "
                             f"size={size_mult:.2f} (fraction={frac_k:.3f})"
                         )
 
@@ -1431,12 +1529,27 @@ def run(demo_mode: bool = False):
                                 f"{old_sm:.2f}x → {size_mult:.2f}x"
                             )
 
-                    adjusted_lot = round(config.LOT_SIZE * size_mult, 2)
-                    adjusted_lot = max(0.01, adjusted_lot)
+                    adjusted_lot, _lot_note = compute_lot(
+                        getattr(config, "SIZING_MODE", "fixed"),
+                        size_mult,
+                        base_lot    = config.LOT_SIZE,
+                        equity      = equity,
+                        risk_pct    = getattr(config, "RISK_PER_TRADE_PCT", 0.5),
+                        sl_distance = sl_pips * point,
+                        tick_value  = float(getattr(sym_info, "trade_tick_value", 0.0) or 0.0),
+                        tick_size   = float(getattr(sym_info, "trade_tick_size", 0.0) or 0.0),
+                        vol_min     = float(getattr(sym_info, "volume_min", 0.01) or 0.01),
+                        vol_step    = float(getattr(sym_info, "volume_step", 0.01) or 0.01),
+                        vol_max     = float(getattr(sym_info, "volume_max", 100.0) or 100.0),
+                        max_lot     = getattr(config, "MAX_LOT_SIZE", None),
+                    )
+                    if adjusted_lot <= 0:
+                        log.info(f"[{symbol}] Sizing: {_lot_note}")
+                        continue
 
                     log.info(
                         f"[{symbol}] Placing {action} | SL={sl_pips:.0f}pts | TP={tp_pips:.0f}pts | "
-                        f"Lot={adjusted_lot} (base={config.LOT_SIZE} × {size_mult:.2f})"
+                        f"Lot={adjusted_lot} ({_lot_note})"
                     )
 
                     if demo_mode:
@@ -1531,6 +1644,10 @@ def run(demo_mode: bool = False):
                         exc_info=True,
                     )
                     continue
+            # A break (max positions reached) leaves later desks unused.
+            for _f in _desk_futs:
+                _f.cancel()
+            _desk_pool.shutdown(wait=False, cancel_futures=True)
             # ── End of per-symbol scan ────────────────────────────────────
             # Log filter funnel — tells you exactly what blocked each symbol
             _active = {k: v for k, v in _funnel.items() if v > 0}
@@ -1638,14 +1755,18 @@ def _sleep(tick_start: datetime):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--demo", action="store_true", help="Log signals only, no real trades")
+    parser.add_argument("--reset-drawdown-halt", action="store_true",
+                        help="Clear a saved drawdown halt and re-anchor peak equity (manual decision)")
     args = parser.parse_args()
+    _reset_halt_once = args.reset_drawdown_halt
 
     # Supervisor: if the main loop dies on an unhandled error, restart instead of
     # exiting silently. Open positions are re-adopted by startup reconciliation.
     _RESTART_DELAY_S = 60
     while True:
         try:
-            run(demo_mode=args.demo)
+            _reset_now, _reset_halt_once = _reset_halt_once, False   # never on auto-restart
+            run(demo_mode=args.demo, reset_drawdown_halt=_reset_now)
             break  # clean exit (Ctrl+C is handled inside run())
         except KeyboardInterrupt:
             break

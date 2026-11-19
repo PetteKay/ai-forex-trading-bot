@@ -223,8 +223,10 @@ class PositionManager:
                     ticket, pos.symbol, pos.volume, pos_type, cfg.MAGIC_NUMBER
                 )
                 if success:
+                    # Keep the record in open_trades: the main loop's closed-trade
+                    # detection picks it up next tick and books the real P&L
+                    # (governor, journal, memory). Popping it here lost that P&L.
                     log.warning(f"KILL: closed {pos_type} {pos.volume} lots ticket={ticket}")
-                    open_trades.pop(ticket, None)
                 else:
                     log.error(f"KILL: failed to close ticket={ticket} — requires manual intervention!")
             except Exception as e:
