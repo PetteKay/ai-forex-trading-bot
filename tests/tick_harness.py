@@ -52,7 +52,8 @@ def _bars(n, freq, seed):
 
 
 def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None,
-                 ticks=1, cfg_extra=None, on_tick_end=None):
+                 ticks=1, cfg_extra=None, on_tick_end=None, reflect_result=None,
+                 close_pnl=1.0):
     """Run `ticks` loop iterations. Returns dict(tick_seconds of the first tick,
     llm_calls, orders, threads_seen, mt5_threads, error)."""
     workdir = tempfile.mkdtemp()
@@ -152,9 +153,13 @@ def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None,
         mock.patch.object(mb, "place_order", side_effect=_mt5(_place_order)),
         mock.patch.object(mb, "get_closed_trade", side_effect=_mt5(lambda t, **k: {
             "ticket": t, "entry_price": 1.1, "exit_price": 1.11, "volume": 0.01, "pnl": 1.0,
-            "swap": 0.0, "commission": 0.0, "net_pnl": 1.0})),
+            "swap": 0.0, "commission": 0.0, "net_pnl": close_pnl})),
         mock.patch.object(bot.llm, "init", return_value=None),
-        mock.patch.object(bot.reflection, "reflect", return_value=None),
+        mock.patch.object(bot.reflection, "reflect", side_effect=_agent(
+            "reflection", lambda *a, **k: (dict(reflect_result, **{"symbol": k["symbol"],
+                "direction": k["direction"], "entry_price": k["entry_price"],
+                "exit_price": k["exit_price"], "pnl_pct": k["pnl_pct"], "outcome": k["outcome"],
+                "fingerprint": "fp", "market_context": {}})) if reflect_result else None)),
         mock.patch.object(bot, "_sleep", side_effect=_sleep),
         mock.patch.object(bot, "fetch_headlines", side_effect=_agent("headlines", lambda *a, **k: ["Dollar firm"])),
         mock.patch.object(bot.technical_analyst, "analyse", side_effect=_agent(
@@ -172,7 +177,11 @@ def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None,
     sem = types.ModuleType("memory.semantic")
     sem.embed_market_context = lambda *a, **k: None
     sem.embed_text = lambda *a, **k: None
-    patches.append(mock.patch.dict(sys.modules, {"memory.semantic": sem}))
+    # Replace only this one module and put it back afterwards. (mock.patch.dict on
+    # sys.modules would also unload everything imported during the run, e.g.
+    # numpy.fft, which numpy cannot load twice.)
+    _had_sem, _old_sem = "memory.semantic" in sys.modules, sys.modules.get("memory.semantic")
+    sys.modules["memory.semantic"] = sem
 
     err = None
     for p in patches:
@@ -188,11 +197,15 @@ def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None,
     finally:
         for p in reversed(patches):
             p.stop()
+        if _had_sem:
+            sys.modules["memory.semantic"] = _old_sem
+        else:
+            sys.modules.pop("memory.semantic", None)
         os.chdir(old_cwd)
     end = tick["end"] or time.perf_counter()
     return {"tick_seconds": round(end - tick["start"], 2), "llm_calls": dict(calls),
             "orders": orders, "threads_seen": len(threads_seen),
-            "mt5_threads": sorted(mt5_threads), "error": err}
+            "mt5_threads": sorted(mt5_threads), "error": err, "workdir": workdir}
 
 
 if __name__ == "__main__":

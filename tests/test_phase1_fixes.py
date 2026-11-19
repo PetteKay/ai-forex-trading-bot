@@ -23,6 +23,23 @@ import pandas as pd   # noqa: E402,F401
 from risk_governor import RiskGovernor  # noqa: E402
 
 
+import contextlib  # noqa: E402
+
+
+@contextlib.contextmanager
+def _module_replaced(name, value):
+    """Replace one sys.modules entry and restore only that entry afterwards."""
+    had, old = name in sys.modules, sys.modules.get(name)
+    sys.modules[name] = value
+    try:
+        yield
+    finally:
+        if had:
+            sys.modules[name] = old
+        else:
+            sys.modules.pop(name, None)
+
+
 def _install_fake_mt5(test, fake):
     """Swap in a fake MetaTrader5 module for one test, restoring only that key."""
     had = "MetaTrader5" in sys.modules
@@ -314,7 +331,7 @@ class TestEveryClosedTradeIsTrainingData(unittest.TestCase):
         lesson = {**tr, "entry_price": 1.0, "exit_price": 1.1, "fingerprint": "x",
                   "lesson": "test", "usefulness_score": 0.9, "ml_sampled": 1}
         from unittest import mock
-        with mock.patch.dict(sys.modules, {"memory.semantic": None}):
+        with _module_replaced("memory.semantic", None):
             self.assertTrue(store.save(lesson))
         self.assertEqual(len(store.get_all_for_training()), 1)
 
@@ -326,7 +343,7 @@ class TestEveryClosedTradeIsTrainingData(unittest.TestCase):
         lesson = {**tr, "entry_price": 1.0, "exit_price": 1.1, "fingerprint": "x",
                   "lesson": "old", "usefulness_score": 0.9}         # pre-fix: ml_sampled 0
         from unittest import mock
-        with mock.patch.dict(sys.modules, {"memory.semantic": None}):
+        with _module_replaced("memory.semantic", None):
             store.save(lesson)
         self.assertEqual(len(store.get_all_for_training()), 1)
 

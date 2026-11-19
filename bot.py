@@ -34,6 +34,8 @@ from datetime import datetime, UTC
 from strategy.position_sizing import compute_lot, kelly_fraction
 from agents.desk import run_desk
 from strategy.bar_gate import BarGate
+from memory.trade_learning import (classify_outcome, update_blacklist, save_training_sample,
+                                   lesson_fields, regime_of)
 from strategy.correlation import _CORR_GROUPS, _check_correlation  # noqa: F401
 
 # Fix Windows console encoding so Unicode box-drawing chars don't crash the logger
@@ -188,16 +190,6 @@ class OpenTradeRecord:
         self.tp            = tp
         self.risk_usd      = risk_usd  # USD at risk from entry to SL (for R-multiple)
         self.volume        = volume
-
-
-# ── Outcome classification (R-multiple, account-size invariant) ──────────────
-# R = net_pnl / initial_risk_usd.  1.0R = made back exactly what we risked.
-def classify_outcome(r_multiple: float) -> str:
-    if r_multiple >= 1.5:   return "WIN_STRONG"   # 150%+ of risk recovered
-    if r_multiple >= 0.3:   return "WIN"           # at least 30% of risk recovered
-    if r_multiple >= -0.15: return "BREAKEVEN"     # flat within spread/commission
-    if r_multiple >= -0.8:  return "LOSS"          # partial loss
-    return "STOP_LOSS"                             # full or near-full stop hit
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -474,19 +466,10 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                 if is_win:
                     _win_streak[sym]  = _win_streak.get(sym, 0) + 1
                     _loss_streak[sym] = 0
-                    if getattr(config, "SETUP_BLACKLIST_ENABLED", False):
-                        journal.reset_blacklist(sym, _regime_at_entry)
                 else:
                     _loss_streak[sym] = _loss_streak.get(sym, 0) + 1
                     _win_streak[sym]  = 0
-                    if getattr(config, "SETUP_BLACKLIST_ENABLED", False):
-                        _bl_count = journal.add_blacklist_loss(sym, _regime_at_entry)
-                        _bl_thresh = getattr(config, "SETUP_BLACKLIST_THRESHOLD", 3)
-                        if _bl_count >= _bl_thresh:
-                            log.warning(
-                                f"[{sym}] BLACKLISTED: {_bl_count} consecutive losses "
-                                f"in {_regime_at_entry} regime — will skip next occurrence."
-                            )
+                update_blacklist(journal, config, sym, _regime_at_entry, is_win)
                 _cur_streak = _loss_streak.get(sym, 0)
                 if _cur_streak >= getattr(config, "LOSS_STREAK_THRESHOLD", 3):
                     log.warning(
@@ -526,65 +509,21 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                     pm_decision        = record.pm_decision,
                     cfg                = config,
                 )
-                _rc_entry = record.entry_context.get("regime", {})
-                _regime_entry = _rc_entry.get("regime", "") if isinstance(_rc_entry, dict) else ""
-                _entry_iso = (record.entry_time.isoformat()
-                              if hasattr(record.entry_time, "isoformat") else str(record.entry_time))
-                _exit_iso  = datetime.now(UTC).isoformat()
-
                 if lesson_record:
-                    lesson_record["feature_vector"] = feature_vector(record.entry_context)
-                    lesson_record["r_multiple"]     = r_multiple
-                    lesson_record["regime"]         = _regime_entry
-                    # Store Tier 1 signal context for ML training
-                    lesson_record["fib_proximity"] = record.entry_context.get("fib_proximity", 0.0)
-                    lesson_record["cot_z_score"]   = record.entry_context.get("cot_z_score", 0.0)
-                    lesson_record["econ_surprise"]  = record.entry_context.get("econ_surprise", 0.0)
-                    lesson_record["entry_time"]     = _entry_iso
-                    # This trade's training row lives in ml_samples (below), so the
-                    # memory copy is excluded from training to avoid counting it twice.
-                    lesson_record["ml_sampled"]     = 1 if record.entry_context else 0
+                    lesson_record.update(lesson_fields(record.entry_context, r_multiple,
+                                                       record.entry_time))
                     saved = memory.save(lesson_record)
                     if saved:
                         log.info(f"★ [{sym}] Lesson saved: {lesson_record['lesson'][:100]}")
 
                 # ── ML training data: EVERY closed trade, not only saved lessons ──
-                # Training only on lessons the reflection LLM chose to keep (and that
-                # survived usefulness pruning) biased the meta-label model's data.
-                # Adopted positions (no entry context) have no features to learn from.
-                if record.entry_context:
-                    try:
-                        memory.save_ml_sample({
-                            "ticket":         ticket,
-                            "symbol":         sym,
-                            "direction":      record.direction,
-                            "entry_time":     _entry_iso,
-                            "exit_time":      _exit_iso,
-                            "feature_vector": feature_vector(record.entry_context),
-                            "regime":         _regime_entry,
-                            "fib_proximity":  record.entry_context.get("fib_proximity", 0.0),
-                            "cot_z_score":    record.entry_context.get("cot_z_score", 0.0),
-                            "econ_surprise":  record.entry_context.get("econ_surprise", 0.0),
-                            "r_multiple":     r_multiple,
-                            "pnl_pct":        pnl_pct,
-                            "outcome":        outcome,
-                        })
-                    except Exception as _ms_err:
-                        log.warning(f"[{sym}] Could not store ML sample: {_ms_err}")
-                    # SGD online update — immediate single-trade adaptation
-                    try:
-                        meta_gate.online_update(
-                            feature_vector = feature_vector(record.entry_context),
-                            is_win         = net_pnl > 0,
-                            regime_str     = _regime_entry,
-                            fib_proximity  = record.entry_context.get("fib_proximity", 0.0),
-                            cot_z_score    = record.entry_context.get("cot_z_score", 0.0),
-                            econ_surprise  = record.entry_context.get("econ_surprise", 0.0),
-                            direction      = record.direction,
-                            entry_time     = record.entry_time,
-                        )
-                    except Exception as _ol_err:
-                        log.debug(f"Online update error: {_ol_err}")
+                # (memory/trade_learning.py — shared with the MCP server)
+                if save_training_sample(
+                        memory, meta_gate, ticket=ticket, symbol=sym,
+                        direction=record.direction, entry_time=record.entry_time,
+                        exit_time=datetime.now(UTC), entry_context=record.entry_context,
+                        r_multiple=r_multiple, pnl_pct=pnl_pct, outcome=outcome,
+                        is_win=net_pnl > 0):
                     memories_since_retrain += 1
                     if memories_since_retrain >= config.META_RETRAIN_EVERY:
                         all_m = memory.get_all_for_training()
