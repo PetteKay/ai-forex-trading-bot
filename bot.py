@@ -158,7 +158,7 @@ except ImportError:
     _DISCOVERED_SIGNALS_AVAILABLE = False
 
 from notifications.telegram_alert import TelegramAlert
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait as _futures_wait
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 if not logging.getLogger().handlers:      # once per process (bot.log isn't reopened)
@@ -702,6 +702,13 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False, control=None
                 _funnel["max_positions"] = len(symbols_list)
                 _scan_list = []
             for symbol in _scan_list:
+                # A pause / stop that arrives during the scan ends it (no order is
+                # in flight here, so confirming it is safe: INV-BC-5).
+                _c = _handle_control()
+                if _c["paused"] or _c["stop"]:
+                    log.info(f"Scan ended early: trading {'stopped' if _c['stop'] else 'paused'} "
+                             f"from an MCP client.")
+                    break
                 _funnel["scanned"] += 1
 
                 try:
@@ -1058,6 +1065,9 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False, control=None
                     _bear_veto    = _job["_bear_veto"]
                     _extra_signals_for_pm = _job["extra_signals"]
 
+                    while not _desk_fut.done():        # keep answering control while desks run
+                        _futures_wait([_desk_fut], timeout=_CONTROL_POLL_S)
+                        _handle_control()
                     _desk      = _desk_fut.result()
                     tech       = _desk["tech"]
                     bear       = _desk["bear"]
@@ -1783,12 +1793,15 @@ def _sleep(tick_start: datetime):
                 log.debug(f"Control poll failed: {e}")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+def main(argv=None) -> int:
+    """`python bot.py [--demo]` or `ForexBot.exe run [--demo]`."""
+    import app_paths
+    app_paths.setup()                      # work from the bot's folder
+    parser = argparse.ArgumentParser(prog="bot.py")
     parser.add_argument("--demo", action="store_true", help="Log signals only, no real trades")
     parser.add_argument("--reset-drawdown-halt", action="store_true",
                         help="Clear a saved drawdown halt and re-anchor peak equity (manual decision)")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     _reset_halt_once = args.reset_drawdown_halt
 
     # One bot.py per account: the account lock (bot_control.py, INV-BC-1/2).
@@ -1797,12 +1810,12 @@ if __name__ == "__main__":
     _ok, _why = _control.acquire()
     if not _ok:
         log.error(f"Not starting: {_why}.")
-        sys.exit(2)
+        return 2
     log.info(f"Bot instance {_control.instance} (pid {os.getpid()}) holds the account lock.")
 
     # Supervisor: if the main loop dies on an unhandled error, restart instead of
     # exiting silently. Open positions are re-adopted by startup reconciliation.
-    _RESTART_DELAY_S = 60
+    from agents.base import ConfigError
     try:
         while True:
             try:
@@ -1811,12 +1824,37 @@ if __name__ == "__main__":
                 break  # clean exit: Ctrl+C or a stop request (both handled inside run())
             except KeyboardInterrupt:
                 break
+            except ConfigError as e:          # a setting to fix: restarting won't help
+                log.error(f"Not starting: {e}")
+                return 2
             except Exception:
                 log.critical(
                     f"Bot crashed with unhandled error — restarting in {_RESTART_DELAY_S}s "
                     f"(open positions will be re-adopted on restart)",
                     exc_info=True,
                 )
-                time.sleep(_RESTART_DELAY_S)
+                if _wait_for_restart(_control, _RESTART_DELAY_S):
+                    log.warning("Stop requested from an MCP client during the restart wait.")
+                    break
     finally:
         _control.release()
+    return 0
+
+
+_RESTART_DELAY_S = 60
+
+
+def _wait_for_restart(control, seconds: float) -> bool:
+    """The supervisor's wait before a restart. Keeps reading the control file
+    (pause is confirmed, stop is honoured) instead of going deaf for a minute.
+    Returns True if a stop was requested."""
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if control.poll()["stop"]:
+            return True
+        time.sleep(min(_CONTROL_POLL_S, max(0.0, end - time.monotonic())))
+    return False
+
+
+if __name__ == "__main__":
+    sys.exit(main())

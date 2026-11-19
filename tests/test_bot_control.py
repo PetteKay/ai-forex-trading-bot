@@ -364,6 +364,35 @@ class BotLoop(unittest.TestCase):
         self.assertGreater(r["llm_calls"].get("portfolio_manager", 0), 0)
         self.assertEqual(r["orders"], [], "an order went out after the pause")
 
+    def test_pause_during_the_scan_ends_it(self):
+        wd = tempfile.mkdtemp()
+        seen = []
+
+        def scan(sym):
+            seen.append(sym)
+            if len(seen) == 2:
+                bc.set_paused(True)
+        r, _ = self.run_bot(workdir=wd, on_scan=scan)
+        self.assertEqual(seen[:2], ["EURUSD", "GBPUSD"])
+        self.assertEqual(len(seen), 2, "the scan went on after the pause")
+        self.assertEqual(r["orders"], [])
+        self.assertTrue(bc.read_status(os.path.join(wd, bc.STATUS_PATH))["paused"])
+
+    def test_pause_is_confirmed_while_desks_run(self):
+        """A pause arriving during stage 2 (LLM desks) is confirmed before they finish."""
+        wd = tempfile.mkdtemp()
+        confirmed = []
+
+        def pause_then_watch(sym):
+            if sym != "EURUSD":
+                return
+            c = bc.set_paused(True)
+            st = bc.wait_for(lambda s: s.get("control_version", -1) >= c["version"], 3)
+            confirmed.append(st is not None)
+        r, _ = self.run_bot(workdir=wd, before_pm=pause_then_watch)
+        self.assertEqual(confirmed, [True], "the bot did not answer while its desks were running")
+        self.assertEqual(r["orders"], [])
+
     def test_stop_request_ends_the_loop_and_a_stale_one_does_not(self):
         wd = tempfile.mkdtemp()
 
@@ -486,7 +515,9 @@ class McpProcesses(unittest.TestCase):
         self.srv = mcp_server
         self.script = mock.patch.object(mcp_server, "_BOT_SCRIPT", os.path.join(ROOT, "tests", "fake_bot.py"))
         self.script.start()
-        self.env = mock.patch.dict(os.environ, {"PYTHONPATH": os.pathsep.join([FAKE, ROOT])})
+        # child processes (bot.py, trainers) work in this temp folder, not the repo
+        self.env = mock.patch.dict(os.environ, {"PYTHONPATH": os.pathsep.join([FAKE, ROOT]),
+                                                "FOREX_BOT_DIR": self.tmp})
         self.env.start()
         sys.modules["data.macro_context"] = type(sys)("data.macro_context")
         sys.modules["data.macro_context"].get_macro_context = lambda s: {}
@@ -587,6 +618,14 @@ class McpProcesses(unittest.TestCase):
         self.assertFalse(bc.bot_state()["running"], "OS did not free the lock")
         self.assertTrue(s.place_trade("EURUSD", "BUY")["placed"])
 
+    def test_start_up_failure_is_reported(self):
+        with mock.patch.dict(os.environ, {"FAKE_BOT_FAIL_START": "1"}):
+            r = self.srv.start_bot()
+        self.assertFalse(r["started"], r)
+        self.assertEqual(r["exit_code"], 2)
+        self.assertTrue(any("LLM_API_KEY" in line for line in r["console"]), r["console"])
+        self.assertFalse(bc.bot_state()["running"])
+
     def test_over_http_only_safe_controls(self):
         s = self.srv
         s._STATE["transport"] = "http"
@@ -605,7 +644,8 @@ class McpProcesses(unittest.TestCase):
         try:
             p = subprocess.run([sys.executable, os.path.join(ROOT, "bot.py"), "--demo"],
                                cwd=self.tmp, capture_output=True, text=True, timeout=120,
-                               env=dict(os.environ, PYTHONPATH=os.pathsep.join([FAKE, ROOT])))
+                               env=dict(os.environ, PYTHONPATH=os.pathsep.join([FAKE, ROOT]),
+                                        FOREX_BOT_DIR=self.tmp))
             self.assertEqual(p.returncode, 2, p.stdout[-2000:] + p.stderr[-2000:])
             self.assertIn("already running", p.stdout + p.stderr)
         finally:

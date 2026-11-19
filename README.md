@@ -159,10 +159,8 @@ cd trading-bot
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
 
-# configure your key
+# configure your key: the bot reads .env automatically
 copy .env.example .env          # then edit .env with your real key
-# load it (or set LLM_API_KEY as a user environment variable once):
-Get-Content .env | ForEach-Object { $n,$v = $_ -split '=',2; [Environment]::SetEnvironmentVariable($n,$v) }
 
 # optional: pre-seed the ML gate from MT5 history (no LLM cost)
 python mt5_historical_trainer.py --bars 8000
@@ -190,6 +188,26 @@ Optional extras: Telegram alerts (`TELEGRAM_BOT_TOKEN`/`CHAT_ID`), a
 localhost-only Flask dashboard (`dashboard/app.py`), daily reports, and a
 backtester (`backtest/`).
 
+### Windows app (no Python needed)
+
+Download `ForexBot-<version>-windows-x64.zip` from the
+[Releases](../../releases) page, unzip it anywhere (for example `C:\ForexBot`),
+and read `START_HERE.txt`. In short: edit `config.py` in that folder, put your
+key in a `.env` file there (copy `.env.example`), open MT5, then in a terminal
+in that folder:
+
+```
+ForexBot run --demo        the bot (start with demo)
+ForexBot dashboard         dashboard on http://127.0.0.1:5000
+ForexBot mcp               MCP server for Claude / Codex / ChatGPT
+ForexBot train-mt5         pre-train the ML gate from MT5 history
+ForexBot --help
+```
+
+Everything the bot writes stays in that folder. To build the app yourself, run
+`build_exe.bat` on Windows: it creates `dist\ForexBot\` and the zip, and
+smoke-tests every command in the built app first.
+
 ---
 
 ## Use it from Claude, Codex or ChatGPT (MCP)
@@ -205,6 +223,9 @@ mt5_bridge.py             all MT5 I/O: candles, orders, deal history
 risk_governor.py          hard limits (TLA+-spec'd, Decimal money math)
 mcp_server.py             MCP server: Claude / Codex / ChatGPT trade and control the bot (MCP.md)
 bot_control.py            account lock, pause / stop / close / retrain requests, tighten-only settings
+forexbot.py               the ForexBot.exe launcher (run / mcp / dashboard / train-*)
+app_paths.py              the bot's folder (source or packaged), .env loading
+build_app.py, forexbot.spec, build_exe.bat   build the Windows app
 trade_booking.py          books closed trades once (governor, journal, ML sample, lesson)
 position_manager.py       trailing SL, break-even, TP ladder, time exits
 agents/                   the 5 LLM agents + validated safe-default layer

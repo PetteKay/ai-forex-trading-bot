@@ -104,6 +104,12 @@ The MCP server can also run and supervise `bot.py`, the autonomous bot, and trai
 
 Replace `C:\path\to\ai-forex-trading-bot` with your folder.
 
+**Using the Windows app (ForexBot.exe)?** Wherever an example below starts the server with `py ...\mcp_server.py`, use the app instead: the command is `C:\path\to\ForexBot\ForexBot.exe` and the arguments are `mcp`. For example, Claude Code:
+```
+claude mcp add --transport stdio forex-bot -- C:\path\to\ForexBot\ForexBot.exe mcp
+```
+and Claude Desktop: `"command": "C:\\path\\to\\ForexBot\\ForexBot.exe", "args": ["mcp"]`.
+
 ### Claude Code
 ```
 claude mcp add --transport stdio forex-bot -- py C:\path\to\ai-forex-trading-bot\mcp_server.py

@@ -208,19 +208,28 @@ def run_demo(memory: TradeMemoryStore):
     log.info("\nThe bot now has initial knowledge. Run 'python bot.py --demo' to see it in action.")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Pre-train bot memory from historical trades")
+def main(argv=None) -> int:
+    """`python trainer.py ...` or `ForexBot.exe train-trades ...`."""
+    import app_paths
+    app_paths.setup()
+    parser = argparse.ArgumentParser(prog="trainer.py",
+                                     description="Pre-train bot memory from historical trades")
     parser.add_argument("--file", help="Path to CSV of historical trades")
     parser.add_argument("--demo", action="store_true", help="Run with built-in sample trades")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if not (args.demo or args.file):
+        log.error("Specify --demo or --file path/to/trades.csv")
+        parser.print_help()
+        return 2
 
     llm.init(config)
     memory = TradeMemoryStore(config.MEMORY_DB_PATH, config.MEMORY_USEFULNESS_THRESHOLD, config.MEMORY_MAX_STORED)
-
     if args.demo:
         run_demo(memory)
-    elif args.file:
-        run_from_csv(args.file, memory)
     else:
-        log.error("Specify --demo or --file path/to/trades.csv")
-        parser.print_help()
+        run_from_csv(args.file, memory)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

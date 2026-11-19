@@ -440,8 +440,11 @@ def run(args):
     mt5b.disconnect()
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
+def main(argv=None) -> int:
+    """`python mt5_historical_trainer.py ...` or `ForexBot.exe train-mt5 ...`."""
+    import app_paths
+    app_paths.setup()
+    parser = argparse.ArgumentParser(prog="mt5_historical_trainer.py",
         description="Seed bot memory with MT5 historical bar data (no LLM, no external APIs)"
     )
     parser.add_argument(
@@ -469,4 +472,9 @@ if __name__ == "__main__":
         dest="max_samples",
         help="Max training samples to save (default: 500)",
     )
-    run(parser.parse_args())
+    run(parser.parse_args(argv))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -689,8 +689,7 @@ def mt5b_equity() -> float:
 
 SAFE_CONTROL = ToolAnnotations(read_only_hint=False, destructive_hint=False,
                                idempotent_hint=True, open_world_hint=False)
-_CODE_DIR = os.path.dirname(os.path.abspath(__file__))
-_BOT_SCRIPT = os.path.join(_CODE_DIR, "bot.py")
+_BOT_SCRIPT = None        # tests: a stand-in bot script instead of bot.py
 _CHILDREN: dict[int, subprocess.Popen] = {}        # bot / trainer processes started here
 _JOBS: dict[str, dict] = {}
 
@@ -812,19 +811,29 @@ def start_bot(live: bool = False) -> dict:
     if st["running"]:
         return _jsonable({"started": False, "error": "bot.py is already running.",
                           "bot": _bot_summary()})
-    args = [bot_control.python_exe(), _BOT_SCRIPT] + ([] if live else ["--demo"])
+    import app_paths      # python bot.py ... from source, ForexBot.exe run ... packaged
+    args = app_paths.command("run", _BOT_SCRIPT) + ([] if live else ["--demo"])
     console = os.path.join("observability", "bot_console.log")
     p = _spawn(args, console)
-    ok = bot_control.wait_for(lambda s: s.get("pid") == p.pid and s.get("state") in
-                              ("starting", "running"), 45, interval=0.2)
-    if ok is None or p.poll() is not None:
+    # Wait until it is past start-up (MT5 connected, LLM ready: state "running"),
+    # so a setup error (no API key, MT5 closed) is reported here, not missed.
+    st, end = {}, time.monotonic() + 60
+    while time.monotonic() < end and p.poll() is None:
+        st = bot_control.read_status()
+        if st.get("pid") == p.pid and st.get("state") == "running":
+            break
+        time.sleep(0.25)
+    if p.poll() is not None:
         return {"started": False, "exit_code": p.poll(),
-                "error": "bot.py did not start. Last console lines below.",
+                "error": "bot.py stopped during start-up. Last console lines below.",
                 "console": _tail(console, 25)}
+    if st.get("pid") != p.pid or st.get("state") != "running":
+        return _jsonable({"started": True, "pid": p.pid, "mode": "live" if live else "demo",
+                          "note": "Still starting (connecting to MT5, training the ML gate). "
+                                  "Check bot_status / get_bot_log shortly."})
     return _jsonable({"started": True, "mode": "live" if live else "demo", "pid": p.pid,
-                      "instance": ok.get("instance"),
-                      "note": "It now connects to MT5, loads memory and trains the ML gate; "
-                              "bot_status shows when it is ticking."})
+                      "instance": st.get("instance"),
+                      "note": "Running. bot_status shows its ticks."})
 
 
 @server.tool(annotations=SAFE_CONTROL)
@@ -966,10 +975,10 @@ def retrain_ml_model() -> dict:
                     "Not enough training data yet: the gate uses its heuristic until it has enough."}
 
 
-_TRAINERS = {
-    "mt5_history":       "mt5_historical_trainer.py",
-    "tick_csv":          "csv_historical_trainer.py",
-    "trade_csv_lessons": "trainer.py",
+_TRAINERS = {                      # kind -> program (app_paths.SCRIPTS)
+    "mt5_history":       "train-mt5",
+    "tick_csv":          "train-ticks",
+    "trade_csv_lessons": "train-trades",
 }
 
 
@@ -992,7 +1001,8 @@ def run_training(kind: str, symbol: str = "", bars: int = 5000, max_samples: int
     if symbol and not re.fullmatch(r"[A-Za-z0-9._#-]{3,20}", symbol):
         return {"started": False, "error": "symbol looks invalid"}
     bars, max_samples = max(100, min(int(bars), 100_000)), max(10, min(int(max_samples), 5000))
-    args = [bot_control.python_exe(), os.path.join(_CODE_DIR, _TRAINERS[kind])]
+    import app_paths
+    args = app_paths.command(_TRAINERS[kind])
     if kind == "mt5_history":
         args += ["--bars", str(bars), "--max-samples", str(max_samples)]
         if symbol:
@@ -1078,8 +1088,9 @@ def main(argv=None):
     # MCP clients start this server from their own working folder (Claude
     # Desktop has no setting for it). The bot's files (observability/,
     # memory DB, governor state) are relative paths, so work from the bot's
-    # folder. FOREX_BOT_DIR overrides it (used by the tests).
-    os.chdir(os.environ.get("FOREX_BOT_DIR") or os.path.dirname(os.path.abspath(__file__)))
+    # folder — or ForexBot.exe's. FOREX_BOT_DIR overrides it (used by the tests).
+    import app_paths
+    app_paths.setup()
 
     log.info(f"Trading mode: {_trading_mode()}  |  sizing: {getattr(config, 'SIZING_MODE', 'fixed')}")
     if args.http:

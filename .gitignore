@@ -52,3 +52,8 @@ observability/bot_control.json*
 observability/settings_overrides.json*
 observability/jobs/
 observability/*.tmp
+
+# Packaged app build output (build_app.py / build_exe.bat)
+build/
+dist/
+.build-venv/

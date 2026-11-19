@@ -3,6 +3,11 @@
 # ============================================================
 
 import os
+try:                                   # keys may live in a .env file next to this one
+    from app_paths import load_env_once as _load_env
+    _load_env()
+except ImportError:
+    pass
 
 # --- LLM (the brain) ---
 # Pick ONE provider block. Comment out the others.
@@ -316,8 +321,8 @@ ENTRY_TIMING_ENABLED = True
 # --- Telegram Trade Alerts ---
 # Get your bot token from @BotFather and chat ID from @userinfobot on Telegram.
 TELEGRAM_ALERTS_ENABLED = False           # Set True once token and chat ID are filled
-TELEGRAM_BOT_TOKEN      = ""             # e.g. "7123456789:AAFxyz..."
-TELEGRAM_CHAT_ID        = ""             # e.g. "123456789" (your numeric user/group ID)
+TELEGRAM_BOT_TOKEN      = os.environ.get("TELEGRAM_BOT_TOKEN", "")  # or .env; e.g. "7123456789:AAFxyz..."
+TELEGRAM_CHAT_ID        = os.environ.get("TELEGRAM_CHAT_ID", "")    # or .env; your numeric user/group ID
 
 # --- Live Economic Calendar ---
 # Fetches real event times from ForexFactory (unofficial JSON endpoint).
