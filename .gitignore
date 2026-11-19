@@ -8,8 +8,8 @@
 *.db-wal
 *.db-shm
 observability/last_equity.json
-observability/governor_state.json
-observability/governor_state.json.tmp
+observability/governor_state*.json
+observability/governor_state*.json.tmp
 observability/reports/
 
 # ── Market data (multi-GB tick exports; regenerate or download separately) ───

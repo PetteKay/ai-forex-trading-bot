@@ -135,6 +135,7 @@ def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None,
         mock.patch.object(mb, "resolve_symbol", side_effect=_mt5(lambda s: s)),
         mock.patch.object(mb, "get_account_equity", side_effect=_mt5(lambda: 10_000.0)),
         mock.patch.object(mb, "get_account_balance", side_effect=_mt5(lambda: 10_000.0)),
+        mock.patch.object(mb, "get_account_login", side_effect=_mt5(lambda: "12345"), create=True),
         mock.patch.object(mb, "get_all_open_positions", side_effect=_mt5(lambda *a: [])),
         mock.patch.object(mb, "get_candles", side_effect=_mt5(
             lambda s, tf, count=200, **k: _bars(count, "h" if tf != "H4" else "4h", abs(hash(s)) % 1000))),

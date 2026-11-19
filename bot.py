@@ -274,6 +274,7 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
         max_drawdown_pct     = config.MAX_DRAWDOWN_PCT,
         allowed_sessions     = config.ALLOWED_SESSIONS,
         state_path           = getattr(config, "GOVERNOR_STATE_PATH", "observability/governor_state.json"),
+        account_id           = mt5b.get_account_login(),
     )
     if reset_drawdown_halt:
         governor.reset_drawdown_halt(starting_equity)

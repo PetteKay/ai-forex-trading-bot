@@ -469,3 +469,37 @@ class TestReutersFeed(unittest.TestCase):
         # USDJPY keywords include "dollar" and "fed" → the dollar story ranks first
         ranked = news_feed._rank_for_symbol(titles, "USDJPY", 1)
         self.assertTrue(ranked[0].startswith("Dollar slips"))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Codex review (PR #1): safety state must belong to one MT5 account
+# ─────────────────────────────────────────────────────────────────────────────
+class TestGovernorStatePerAccount(unittest.TestCase):
+    def setUp(self):
+        self.dir  = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "governor_state.json")
+
+    def _gov(self, equity, acct):
+        return RiskGovernor(starting_equity=equity, daily_loss_cap_pct=2.0, max_open_positions=3,
+                            max_orders_per_day=10, max_drawdown_pct=10.0,
+                            state_path=self.path, account_id=acct)
+
+    def test_other_account_does_not_inherit_halt_or_peak(self):
+        big = self._gov(100_000.0, "111")
+        big.update_equity(100_000.0)
+        self.assertFalse(big.approve(85_000.0, 0)[0])          # 15% drawdown → halt on 111
+        small = self._gov(1_000.0, "222")                       # switch to a small account
+        ok, reason = small.approve(1_000.0, 0)
+        self.assertTrue(ok, f"account 222 inherited account 111's state: {reason}")
+
+    def test_same_account_keeps_its_state(self):
+        a = self._gov(100_000.0, "111")
+        a.approve(85_000.0, 0)
+        self._gov(1_000.0, "222").approve(1_000.0, 0)
+        back = self._gov(85_000.0, "111")                       # back to the first account
+        self.assertFalse(back.approve(85_000.0, 0)[0], "account 111 lost its drawdown halt")
+
+    def test_each_account_has_its_own_file(self):
+        self._gov(1_000.0, "111"); self._gov(1_000.0, "222")
+        names = sorted(os.listdir(self.dir))
+        self.assertEqual(names, ["governor_state_111.json", "governor_state_222.json"])
