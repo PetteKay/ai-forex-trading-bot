@@ -189,7 +189,7 @@ def classify_outcome(r_multiple: float) -> str:
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
-def run(demo_mode: bool = False):
+def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
     # Build watch list — use SYMBOLS if set, else fall back to single SYMBOL
     symbols_config = getattr(config, "SYMBOLS", None) or [config.SYMBOL]
 
@@ -262,7 +262,10 @@ def run(demo_mode: bool = False):
         max_orders_per_day   = config.MAX_ORDERS_PER_DAY,
         max_drawdown_pct     = config.MAX_DRAWDOWN_PCT,
         allowed_sessions     = config.ALLOWED_SESSIONS,
+        state_path           = getattr(config, "GOVERNOR_STATE_PATH", "observability/governor_state.json"),
     )
+    if reset_drawdown_halt:
+        governor.reset_drawdown_halt(starting_equity)
     calendar      = EconomicCalendar(
         blackout_before_min = config.CALENDAR_BLACKOUT_BEFORE_MIN,
         blackout_after_min  = config.CALENDAR_BLACKOUT_AFTER_MIN,
@@ -1638,14 +1641,18 @@ def _sleep(tick_start: datetime):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--demo", action="store_true", help="Log signals only, no real trades")
+    parser.add_argument("--reset-drawdown-halt", action="store_true",
+                        help="Clear a saved drawdown halt and re-anchor peak equity (manual decision)")
     args = parser.parse_args()
+    _reset_halt_once = args.reset_drawdown_halt
 
     # Supervisor: if the main loop dies on an unhandled error, restart instead of
     # exiting silently. Open positions are re-adopted by startup reconciliation.
     _RESTART_DELAY_S = 60
     while True:
         try:
-            run(demo_mode=args.demo)
+            _reset_now, _reset_halt_once = _reset_halt_once, False   # never on auto-restart
+            run(demo_mode=args.demo, reset_drawdown_halt=_reset_now)
             break  # clean exit (Ctrl+C is handled inside run())
         except KeyboardInterrupt:
             break

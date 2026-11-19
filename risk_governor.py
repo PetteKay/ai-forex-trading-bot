@@ -16,13 +16,27 @@ Design formally verified with TLA+ (specs/RiskGovernor.tla).
 from decimal import Decimal
 from datetime import date, datetime, timezone
 from typing import Optional
+import json
 import logging
+import os
 
 log = logging.getLogger("RiskGovernor")
 
 # Sessions where trading is allowed (empty set = always allowed)
 # Override via config.ALLOWED_SESSIONS
 ALWAYS_ALLOWED_SESSIONS = set()
+
+
+def _persists(method):
+    """Save governor state to disk after the wrapped call (no-op without state_path)."""
+    def wrapper(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self._save_state()
+    wrapper.__name__ = method.__name__
+    wrapper.__doc__  = method.__doc__
+    return wrapper
 
 
 class RiskGovernor:
@@ -34,7 +48,14 @@ class RiskGovernor:
         max_orders_per_day: int,
         max_drawdown_pct: float = 10.0,
         allowed_sessions: Optional[list] = None,
+        state_path: Optional[str] = None,
     ):
+        """
+        state_path: JSON file where safety state is saved after every change and
+        restored on startup. Without it, a restart forgets today's losses, the
+        kill switch and the drawdown halt (verified bug). None = in-memory only
+        (used by tests and backtests).
+        """
         self._starting_equity    = Decimal(str(starting_equity))
         self._peak_equity        = Decimal(str(starting_equity))
         self._daily_loss_cap_pct = Decimal(str(daily_loss_cap_pct))
@@ -51,8 +72,15 @@ class RiskGovernor:
         self._today              = datetime.now(timezone.utc).date()   # UTC
         self._current_equity     = Decimal(str(starting_equity))       # updated every tick
 
+        self._state_path         = state_path
+        self._last_saved: Optional[dict] = None
+        if state_path:
+            self._load_state()
+            self._save_state()
+
     # ── Public API ────────────────────────────────────────────────────────────
 
+    @_persists
     def approve(
         self,
         current_equity: float,
@@ -123,11 +151,13 @@ class RiskGovernor:
 
         return True, ""
 
+    @_persists
     def record_order_placed(self):
         self._orders_today   += 1
         self._open_positions += 1
         log.info(f"Order recorded. Today: {self._orders_today} orders, {self._open_positions} open.")
 
+    @_persists
     def record_trade_closed(self, pnl_amount: float):
         """pnl_amount = realised net P&L (positive for profit, negative for loss)."""
         pnl = Decimal(str(pnl_amount))
@@ -144,6 +174,7 @@ class RiskGovernor:
             f"Daily P&L: {self._daily_pnl:+.2f}. Kill: {self._kill_active}"
         )
 
+    @_persists
     def record_mark_to_market(self, unrealised_pnl: float):
         """
         Called every tick with total unrealised P&L.
@@ -158,6 +189,7 @@ class RiskGovernor:
                 f"KILL SWITCH ACTIVATED by mark-to-market. Unrealised P&L: {unrealised_pnl:.2f}"
             )
 
+    @_persists
     def update_equity(self, current_equity: float):
         """Update peak equity tracker (call every tick)."""
         eq = Decimal(str(current_equity))
@@ -184,6 +216,7 @@ class RiskGovernor:
             "today":          str(self._today),
         }
 
+    @_persists
     def check_startup_gap(self, prev_equity: float, current_equity: float) -> None:
         """
         Call once at bot startup to detect overnight gap losses.
@@ -219,6 +252,86 @@ class RiskGovernor:
                 f"Overnight gap detected: -{float(gap_loss):.2f} "
                 f"(daily P&L now {float(self._daily_pnl):+.2f})"
             )
+
+    def reset_drawdown_halt(self, current_equity: float) -> None:
+        """Manual reset after a drawdown halt: clears the halt and re-anchors peak equity."""
+        self._drawdown_halt  = False
+        self._peak_equity    = Decimal(str(current_equity))
+        self._current_equity = Decimal(str(current_equity))
+        log.warning(f"Drawdown halt manually reset. Peak equity re-anchored to {current_equity:.2f}")
+        self._save_state()
+
+    # ── Persistence ───────────────────────────────────────────────────────────
+
+    def _snapshot(self) -> dict:
+        return {
+            "version":         1,
+            "today":           self._today.isoformat(),
+            "daily_pnl":       str(self._daily_pnl),
+            "kill_active":     self._kill_active,
+            "orders_today":    self._orders_today,
+            "day_anchor":      str(self._starting_equity),
+            "drawdown_halt":   self._drawdown_halt,
+            "peak_equity":     str(self._peak_equity),
+        }
+
+    def _save_state(self) -> None:
+        if not self._state_path:
+            return
+        snap = self._snapshot()
+        if snap == self._last_saved:
+            return
+        try:
+            folder = os.path.dirname(self._state_path)
+            if folder:
+                os.makedirs(folder, exist_ok=True)
+            tmp = self._state_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(snap, f, indent=2)
+            os.replace(tmp, self._state_path)   # atomic: never leaves a half-written file
+            self._last_saved = snap
+        except Exception as e:
+            log.error(f"Could not save governor state to {self._state_path}: {e}")
+
+    def _load_state(self) -> None:
+        if not os.path.exists(self._state_path):
+            log.info("Governor: no saved state — starting fresh.")
+            return
+        try:
+            with open(self._state_path, "r") as f:
+                st = json.load(f)
+        except Exception as e:
+            # Fail safe: an unreadable state file must not silently clear a halt.
+            self._kill_active = True
+            log.error(
+                f"Governor state file {self._state_path} unreadable ({e}). "
+                "Kill switch ON for today as a precaution."
+            )
+            return
+
+        # Drawdown halt and peak equity carry across days.
+        self._drawdown_halt = bool(st.get("drawdown_halt", False))
+        try:
+            saved_peak = Decimal(str(st.get("peak_equity", "0")))
+            if saved_peak > self._peak_equity:
+                self._peak_equity = saved_peak
+        except Exception:
+            pass
+
+        # Daily figures carry over only on the same UTC day.
+        if st.get("today") == self._today.isoformat():
+            try:
+                self._daily_pnl       = Decimal(str(st.get("daily_pnl", "0")))
+                self._starting_equity = Decimal(str(st.get("day_anchor", self._starting_equity)))
+            except Exception:
+                pass
+            self._kill_active  = bool(st.get("kill_active", False))
+            self._orders_today = int(st.get("orders_today", 0))
+        log.info(
+            f"Governor state restored: daily_pnl={self._daily_pnl} kill={self._kill_active} "
+            f"orders_today={self._orders_today} drawdown_halt={self._drawdown_halt} "
+            f"peak={self._peak_equity}"
+        )
 
     # ── Internal ──────────────────────────────────────────────────────────────
 

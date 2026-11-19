@@ -204,6 +204,9 @@ ALLOWED_REGIMES = [
 
 # --- Observability ---
 JOURNAL_DB_PATH    = "observability/trade_journal.db"
+# Risk governor safety state (daily P&L, kill switch, drawdown halt, peak equity).
+# Survives restarts and crash auto-restarts. Delete only if you know why.
+GOVERNOR_STATE_PATH = "observability/governor_state.json"
 EQUITY_LOG_EVERY   = 5      # Log equity snapshot every N ticks
 
 # --- Loop ---
