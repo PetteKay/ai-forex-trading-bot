@@ -52,7 +52,7 @@ def _bars(n, freq, seed):
 
 
 def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None,
-                 ticks=1, cfg_extra=None):
+                 ticks=1, cfg_extra=None, on_tick_end=None):
     """Run `ticks` loop iterations. Returns dict(tick_seconds of the first tick,
     llm_calls, orders, threads_seen, mt5_threads, error)."""
     workdir = tempfile.mkdtemp()
@@ -103,15 +103,22 @@ def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None,
 
     def _sleep(tick_start):
         tick["n"] = tick.get("n", 0) + 1
+        if on_tick_end:
+            on_tick_end(tick["n"], config, open_positions)
         if tick["end"] is None:
             tick["end"] = time.perf_counter()
         if tick["n"] >= ticks:
             raise KeyboardInterrupt   # bot.run() treats this as a clean stop
 
+    open_positions = []      # orders stay open (never closed) in the harness
+
     def _place_order(**k):
         orders.append(k["symbol"])
-        return {"ticket": 1000 + len(orders), "price": 1.1, "sl": 1.09, "tp": 1.12,
-                "volume": k["lot_size"]}
+        t = 1000 + len(orders)
+        open_positions.append({"ticket": t, "symbol": k["symbol"], "type": k["direction"],
+                               "volume": k["lot_size"], "price": 1.1, "sl": 1.09, "tp": 1.12,
+                               "profit": 0.0, "time": 0})
+        return {"ticket": t, "price": 1.1, "sl": 1.09, "tp": 1.12, "volume": k["lot_size"]}
 
     cfg_over = dict(SYMBOLS=symbols, LIVE_CALENDAR_ENABLED=False, CUSUM_DISABLED=True,
                     TELEGRAM_ALERTS_ENABLED=False, ALLOWED_SESSIONS=[],
@@ -135,14 +142,19 @@ def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None,
         mock.patch.object(mb, "resolve_symbol", side_effect=_mt5(lambda s: s)),
         mock.patch.object(mb, "get_account_equity", side_effect=_mt5(lambda: 10_000.0)),
         mock.patch.object(mb, "get_account_balance", side_effect=_mt5(lambda: 10_000.0)),
-        mock.patch.object(mb, "get_all_open_positions", side_effect=_mt5(lambda *a: [])),
+        mock.patch.object(mb, "get_account_login", side_effect=_mt5(lambda: "12345"), create=True),
+        mock.patch.object(mb, "get_all_open_positions", side_effect=_mt5(lambda *a: list(open_positions))),
         mock.patch.object(mb, "get_candles", side_effect=_mt5(
             lambda s, tf, count=200, **k: _bars(count, "h" if tf != "H4" else "4h", abs(hash(s)) % 1000))),
         mock.patch.object(mb, "get_live_price", side_effect=_mt5(lambda s: None)),
         mock.patch.object(mb, "get_spread_pips", side_effect=_mt5(lambda s: 1.0)),
         mock.patch.object(mb, "get_risk_usd", side_effect=_mt5(lambda *a, **k: 10.0)),
         mock.patch.object(mb, "place_order", side_effect=_mt5(_place_order)),
+        mock.patch.object(mb, "get_closed_trade", side_effect=_mt5(lambda t, **k: {
+            "ticket": t, "entry_price": 1.1, "exit_price": 1.11, "volume": 0.01, "pnl": 1.0,
+            "swap": 0.0, "commission": 0.0, "net_pnl": 1.0})),
         mock.patch.object(bot.llm, "init", return_value=None),
+        mock.patch.object(bot.reflection, "reflect", return_value=None),
         mock.patch.object(bot, "_sleep", side_effect=_sleep),
         mock.patch.object(bot, "fetch_headlines", side_effect=_agent("headlines", lambda *a, **k: ["Dollar firm"])),
         mock.patch.object(bot.technical_analyst, "analyse", side_effect=_agent(

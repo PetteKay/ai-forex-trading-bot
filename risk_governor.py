@@ -49,12 +49,17 @@ class RiskGovernor:
         max_drawdown_pct: float = 10.0,
         allowed_sessions: Optional[list] = None,
         state_path: Optional[str] = None,
+        account_id: Optional[str] = None,
     ):
         """
         state_path: JSON file where safety state is saved after every change and
         restored on startup. Without it, a restart forgets today's losses, the
         kill switch and the drawdown halt (verified bug). None = in-memory only
         (used by tests and backtests).
+
+        account_id: the MT5 account login. Each account gets its own state file
+        (e.g. governor_state_12345.json), so switching accounts — demo to live —
+        never applies one account's drawdown halt or peak equity to another.
         """
         self._starting_equity    = Decimal(str(starting_equity))
         self._peak_equity        = Decimal(str(starting_equity))
@@ -72,6 +77,10 @@ class RiskGovernor:
         self._today              = datetime.now(timezone.utc).date()   # UTC
         self._current_equity     = Decimal(str(starting_equity))       # updated every tick
 
+        self._account_id         = str(account_id) if account_id not in (None, "") else None
+        if state_path and self._account_id:
+            _root, _ext = os.path.splitext(state_path)
+            state_path = f"{_root}_{self._account_id}{_ext or '.json'}"
         self._state_path         = state_path
         self._last_saved: Optional[dict] = None
         if state_path:
@@ -266,6 +275,7 @@ class RiskGovernor:
     def _snapshot(self) -> dict:
         return {
             "version":         1,
+            "account":         self._account_id,
             "today":           self._today.isoformat(),
             "daily_pnl":       str(self._daily_pnl),
             "kill_active":     self._kill_active,
@@ -306,6 +316,14 @@ class RiskGovernor:
             log.error(
                 f"Governor state file {self._state_path} unreadable ({e}). "
                 "Kill switch ON for today as a precaution."
+            )
+            return
+
+        saved_acct = st.get("account")
+        if self._account_id and saved_acct and str(saved_acct) != self._account_id:
+            log.warning(
+                f"Governor state file belongs to account {saved_acct}, not {self._account_id} — "
+                "ignoring it and starting fresh for this account."
             )
             return
 

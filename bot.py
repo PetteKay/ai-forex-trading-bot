@@ -275,6 +275,7 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
         max_drawdown_pct     = config.MAX_DRAWDOWN_PCT,
         allowed_sessions     = config.ALLOWED_SESSIONS,
         state_path           = getattr(config, "GOVERNOR_STATE_PATH", "observability/governor_state.json"),
+        account_id           = mt5b.get_account_login(),
     )
     if reset_drawdown_halt:
         governor.reset_drawdown_halt(starting_equity)
@@ -665,7 +666,14 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
 
             # Stage 1 (main thread): data, filters, memory recall — all MT5 calls.
             _jobs: list[dict] = []
-            for symbol in symbols_list:
+            # Already at the position limit: no new trade is possible this tick,
+            # so don't spend LLM calls on desks (positions are managed above).
+            _scan_list = symbols_list
+            if open_count >= config.MAX_OPEN_POSITIONS:
+                log.info(f"At max open positions ({open_count}) — skipping the symbol scan.")
+                _funnel["max_positions"] = len(symbols_list)
+                _scan_list = []
+            for symbol in _scan_list:
                 _funnel["scanned"] += 1
 
                 try:
@@ -1004,8 +1012,10 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
 
             # Stage 3 (main thread, original symbol order): adjustments, gates,
             # Risk Manager, sizing, orders.
+            _decided: set[str] = set()
             for _job, _desk_fut in zip(_jobs, _desk_futs):
                 symbol = _job["symbol"]
+                _decided.add(symbol)
                 try:
                     ctx           = _job["ctx"]
                     regime_info   = _job["regime_info"]
@@ -1645,7 +1655,11 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                         exc_info=True,
                     )
                     continue
-            # A break (max positions reached) leaves later desks unused.
+            # A break (max positions reached) leaves later desks unused: release
+            # their candles so they are evaluated once capacity frees up.
+            for _job in _jobs:
+                if _job["symbol"] not in _decided:
+                    _bar_gate.retry(_job["symbol"])
             for _f in _desk_futs:
                 _f.cancel()
             _desk_pool.shutdown(wait=False, cancel_futures=True)
