@@ -31,6 +31,7 @@ import json
 import os
 import sys
 from datetime import datetime, UTC
+from strategy.position_sizing import compute_lot, kelly_fraction
 
 # Fix Windows console encoding so Unicode box-drawing chars don't crash the logger
 if hasattr(sys.stdout, "reconfigure"):
@@ -266,6 +267,14 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
     )
     if reset_drawdown_halt:
         governor.reset_drawdown_halt(starting_equity)
+
+    if (getattr(config, "SIZING_MODE", "fixed") == "fixed"
+            and compute_lot("fixed", 0.5, base_lot=config.LOT_SIZE)[0] >= config.LOT_SIZE):
+        log.warning(
+            f"Sizing: SIZING_MODE='fixed' with LOT_SIZE={config.LOT_SIZE} — size "
+            f"adjustments (Kelly, HMM, volatility, loss streak) cannot reduce the lot. "
+            f"Use SIZING_MODE='risk_pct' or a larger LOT_SIZE for them to take effect."
+        )
     calendar      = EconomicCalendar(
         blackout_before_min = config.CALENDAR_BLACKOUT_BEFORE_MIN,
         blackout_after_min  = config.CALENDAR_BLACKOUT_AFTER_MIN,
@@ -1418,12 +1427,17 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                         # Payoff must match the ACTUAL trade geometry (symbol-specific
                         # TP mult / adaptive SL mult), not the global config defaults.
                         payoff_b = _tp_base_mult / _sl_mult if _sl_mult > 0 else config.ATR_TP_MULT / config.ATR_SL_MULT
-                        kelly_f  = (ml_p * payoff_b - (1.0 - ml_p)) / payoff_b
-                        kelly_f  = max(0.0, kelly_f)
-                        frac_k   = kelly_f * getattr(config, "KELLY_FRACTION", 0.25)
-                        size_mult = min(size_mult, frac_k) if frac_k > 0 else size_mult
+                        frac_k   = kelly_fraction(ml_p, payoff_b, getattr(config, "KELLY_FRACTION", 0.25))
+                        if frac_k <= 0:
+                            # Kelly says no edge at these odds. Previously this kept
+                            # the FULL size; now it means no trade.
+                            log.info(
+                                f"[{symbol}] ¼-Kelly: p={ml_p:.3f}, b={payoff_b:.2f} → no edge. Skipping."
+                            )
+                            continue
+                        size_mult = min(size_mult, frac_k)
                         log.info(
-                            f"¼-Kelly: p={ml_p:.3f}, b={payoff_b:.2f} → kelly={kelly_f:.3f} → "
+                            f"¼-Kelly: p={ml_p:.3f}, b={payoff_b:.2f} → "
                             f"size={size_mult:.2f} (fraction={frac_k:.3f})"
                         )
 
@@ -1479,12 +1493,27 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                                 f"{old_sm:.2f}x → {size_mult:.2f}x"
                             )
 
-                    adjusted_lot = round(config.LOT_SIZE * size_mult, 2)
-                    adjusted_lot = max(0.01, adjusted_lot)
+                    adjusted_lot, _lot_note = compute_lot(
+                        getattr(config, "SIZING_MODE", "fixed"),
+                        size_mult,
+                        base_lot    = config.LOT_SIZE,
+                        equity      = equity,
+                        risk_pct    = getattr(config, "RISK_PER_TRADE_PCT", 0.5),
+                        sl_distance = sl_pips * point,
+                        tick_value  = float(getattr(sym_info, "trade_tick_value", 0.0) or 0.0),
+                        tick_size   = float(getattr(sym_info, "trade_tick_size", 0.0) or 0.0),
+                        vol_min     = float(getattr(sym_info, "volume_min", 0.01) or 0.01),
+                        vol_step    = float(getattr(sym_info, "volume_step", 0.01) or 0.01),
+                        vol_max     = float(getattr(sym_info, "volume_max", 100.0) or 100.0),
+                        max_lot     = getattr(config, "MAX_LOT_SIZE", None),
+                    )
+                    if adjusted_lot <= 0:
+                        log.info(f"[{symbol}] Sizing: {_lot_note}")
+                        continue
 
                     log.info(
                         f"[{symbol}] Placing {action} | SL={sl_pips:.0f}pts | TP={tp_pips:.0f}pts | "
-                        f"Lot={adjusted_lot} (base={config.LOT_SIZE} × {size_mult:.2f})"
+                        f"Lot={adjusted_lot} ({_lot_note})"
                     )
 
                     if demo_mode:

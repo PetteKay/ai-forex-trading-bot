@@ -130,6 +130,16 @@ SYMBOLS = [
 # --- Position Sizing ---
 LOT_SIZE     = 0.01          # Micro lot = ~$1/pip on EURUSD. Start small.
 
+# ── Position sizing ──────────────────────────────────────────────────────────
+# "fixed":    lot = LOT_SIZE × size multiplier (original behaviour). NOTE: at
+#             LOT_SIZE 0.01 every multiplier below 1.5 rounds back to 0.01, so the
+#             Kelly / HMM / volatility / loss-streak adjustments have no effect.
+# "risk_pct": risk RISK_PER_TRADE_PCT of equity per trade (× size multiplier),
+#             sized from the stop distance; skipped if below the broker minimum.
+SIZING_MODE        = "fixed"
+RISK_PER_TRADE_PCT = 0.5     # % of equity risked per trade in "risk_pct" mode
+MAX_LOT_SIZE       = 1.0     # hard cap per order in "risk_pct" mode
+
 # --- Risk Governor (SAFETY — never remove) ---
 MAX_OPEN_POSITIONS  = 3      # Up to 3 concurrent trades (diversified across uncorrelated pairs)
 MAX_ORDERS_PER_DAY  = 8      # Up to 8 trades per day across all symbols

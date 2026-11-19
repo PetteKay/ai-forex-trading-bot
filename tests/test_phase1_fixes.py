@@ -329,3 +329,67 @@ class TestEveryClosedTradeIsTrainingData(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"memory.semantic": None}):
             store.save(lesson)
         self.assertEqual(len(store.get_all_for_training()), 1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bugs 8-9: position sizing
+# ─────────────────────────────────────────────────────────────────────────────
+class TestPositionSizing(unittest.TestCase):
+    # EURUSD-like contract: tick 0.00001 worth $1 per lot → $10/pip per lot
+    EU = dict(tick_value=1.0, tick_size=0.00001, vol_min=0.01, vol_step=0.01, vol_max=100.0)
+
+    def test_fixed_mode_matches_original_formula(self):
+        from strategy.position_sizing import compute_lot
+        for base in (0.01, 0.1, 0.5):
+            for m in (0.05, 0.25, 0.5, 0.7, 1.0):
+                self.assertEqual(compute_lot("fixed", m, base_lot=base)[0],
+                                 max(0.01, round(base * m, 2)))
+
+    def test_fixed_mode_at_001_cannot_scale_documented(self):
+        from strategy.position_sizing import compute_lot
+        lots = {compute_lot("fixed", m, base_lot=0.01)[0] for m in (0.05, 0.25, 0.5, 0.7, 1.0)}
+        self.assertEqual(lots, {0.01})
+
+    def test_risk_pct_scales_with_multiplier(self):
+        from strategy.position_sizing import compute_lot
+        # $10,000 equity, 1% risk, 20-pip stop → $100 / $200 per lot = 0.50 lot
+        full = compute_lot("risk_pct", 1.0, equity=10_000, risk_pct=1.0,
+                           sl_distance=0.0020, **self.EU)[0]
+        half = compute_lot("risk_pct", 0.5, equity=10_000, risk_pct=1.0,
+                           sl_distance=0.0020, **self.EU)[0]
+        self.assertAlmostEqual(full, 0.50)
+        self.assertAlmostEqual(half, 0.25)
+
+    def test_risk_pct_dollar_risk_is_exact(self):
+        from strategy.position_sizing import compute_lot
+        lot = compute_lot("risk_pct", 1.0, equity=5_000, risk_pct=0.5,
+                          sl_distance=0.0015, **self.EU)[0]
+        loss_if_stopped = lot * (0.0015 / 0.00001) * 1.0
+        self.assertLessEqual(loss_if_stopped, 5_000 * 0.005 + 1e-9,
+                             "Rounding must never risk more than the target")
+
+    def test_risk_pct_skips_instead_of_rounding_up(self):
+        from strategy.position_sizing import compute_lot
+        lot, note = compute_lot("risk_pct", 1.0, equity=100, risk_pct=0.5,
+                                sl_distance=0.0020, **self.EU)        # needs 0.0025 lot
+        self.assertEqual(lot, 0.0)
+        self.assertIn("below the broker minimum", note)
+
+    def test_risk_pct_respects_caps(self):
+        from strategy.position_sizing import compute_lot
+        lot = compute_lot("risk_pct", 1.0, equity=10_000_000, risk_pct=1.0,
+                          sl_distance=0.0020, max_lot=1.0, **self.EU)[0]
+        self.assertEqual(lot, 1.0)
+
+    def test_kelly_no_edge_is_zero(self):
+        from strategy.position_sizing import kelly_fraction
+        self.assertEqual(kelly_fraction(0.30, 1.25, 0.25), 0.0)
+        self.assertGreater(kelly_fraction(0.60, 1.67, 0.25), 0.0)
+
+    def test_bot_skips_trade_when_kelly_has_no_edge(self):
+        src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "bot.py")).read()
+        self.assertNotIn("if frac_k > 0 else size_mult", src,
+                         "Zero-edge Kelly must not fall back to full size")
+        i = src.index("if frac_k <= 0:")
+        self.assertIn("continue", src[i:i + 400])
