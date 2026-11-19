@@ -393,3 +393,44 @@ class TestPositionSizing(unittest.TestCase):
                          "Zero-edge Kelly must not fall back to full size")
         i = src.index("if frac_k <= 0:")
         self.assertIn("continue", src[i:i + 400])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bug 11: adopted positions restarted the 48h max-hold clock on every restart
+# ─────────────────────────────────────────────────────────────────────────────
+class TestAdoptedPositionOpenTime(unittest.TestCase):
+    def _bridge(self, tick_time):
+        import types
+        m = types.ModuleType("MetaTrader5")
+        m.__getattr__ = lambda name: 0
+        m.symbol_info_tick = lambda s: types.SimpleNamespace(time=tick_time)
+        _install_fake_mt5(self, m)
+        import mt5_bridge
+        return mt5_bridge
+
+    def test_server_time_offset_is_removed(self):
+        from datetime import datetime, timezone
+        now = datetime(2026, 11, 19, 12, 0, 30, tzinfo=timezone.utc)
+        srv_offset = 2 * 3600                              # broker on UTC+2
+        b = self._bridge(int(now.timestamp()) + srv_offset - 20)   # tick 20s old
+        opened_utc = datetime(2026, 11, 18, 9, 0, tzinfo=timezone.utc)
+        got = b.terminal_time_to_utc(int(opened_utc.timestamp()) + srv_offset, "EURUSD", now)
+        self.assertEqual(got, opened_utc)
+
+    def test_utc_terminal_needs_no_offset(self):
+        from datetime import datetime, timezone
+        now = datetime(2026, 11, 19, 12, 0, tzinfo=timezone.utc)
+        b = self._bridge(int(now.timestamp()) - 5)
+        opened = datetime(2026, 11, 17, 22, 15, tzinfo=timezone.utc)
+        self.assertEqual(b.terminal_time_to_utc(int(opened.timestamp()), "EURUSD", now), opened)
+
+    def test_stale_tick_returns_none(self):
+        from datetime import datetime, timezone
+        now = datetime(2026, 11, 22, 12, 0, tzinfo=timezone.utc)   # Sunday
+        b = self._bridge(int(now.timestamp()) - 40 * 3600 - 777)   # Friday's last tick
+        self.assertIsNone(b.terminal_time_to_utc(1_763_000_000, "EURUSD", now))
+
+    def test_bot_uses_position_open_time(self):
+        src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "bot.py")).read()
+        self.assertIn('entry_time    = _opened or datetime.now(UTC)', src)

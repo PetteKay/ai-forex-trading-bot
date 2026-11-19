@@ -318,6 +318,15 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
     _existing = mt5b.get_all_open_positions(config.MAGIC_NUMBER)
     for _pos in _existing:
         _ticket = _pos["ticket"]
+        # Real open time from MT5, so the max-hold time exit keeps counting from
+        # the actual entry instead of restarting at every bot restart.
+        try:
+            _opened = mt5b.terminal_time_to_utc(_pos.get("time", 0), _pos["symbol"])
+        except Exception:
+            _opened = None
+        if _opened is None:
+            log.warning(f"[{_pos['symbol']}] ticket {_ticket}: open time unavailable "
+                        f"(market closed?) — using now; max-hold clock restarts.")
         if _ticket not in open_trades:
             open_trades[_ticket] = OpenTradeRecord(
                 ticket        = _ticket,
@@ -327,7 +336,7 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                 entry_context = {},
                 tech_analysis = {},
                 pm_decision   = {},
-                entry_time    = datetime.now(UTC),  # best available; exact time unknown
+                entry_time    = _opened or datetime.now(UTC),
                 atr           = 0.0,
                 sl            = _pos["sl"],
                 tp            = _pos["tp"],

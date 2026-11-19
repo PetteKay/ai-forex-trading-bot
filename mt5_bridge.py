@@ -253,9 +253,35 @@ def get_all_open_positions(magic: int) -> list[dict]:
             "sl":     p.sl,
             "tp":     p.tp,
             "profit": p.profit,
+            "time":   int(getattr(p, "time", 0) or 0),   # open time, terminal timebase
         }
         for p in positions if p.magic == magic
     ]
+
+
+def terminal_time_to_utc(ts: int, symbol: str, now_utc=None):
+    """
+    Convert a position/deal timestamp from the terminal's timebase to UTC.
+
+    MQL5 forum answers disagree on whether these timestamps are UTC or broker
+    server time, so the offset is MEASURED instead of assumed: the symbol's
+    latest tick time minus the real UTC clock, rounded to the nearest 30 min
+    (≈0 if the terminal already uses UTC). If the tick is stale (market closed),
+    the gap is not close to a 30-min multiple and None is returned.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+    if not ts:
+        return None
+    now_utc = now_utc or _dt.now(_tz.utc)
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None or not getattr(tick, "time", 0):
+        return None
+    raw     = float(tick.time) - now_utc.timestamp()
+    offset  = round(raw / 1800.0) * 1800.0
+    if abs(raw - offset) > 300:          # tick older than 5 min → can't measure
+        return None
+    dt = _dt.fromtimestamp(ts - offset, tz=_tz.utc)
+    return min(dt, now_utc)
 
 
 def get_unrealised_pnl(symbol: str, magic: int) -> float:
