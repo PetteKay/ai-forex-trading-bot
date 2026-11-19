@@ -53,10 +53,10 @@ def _bars(n, freq, seed):
 
 def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None,
                  ticks=1, cfg_extra=None, on_tick_end=None, reflect_result=None,
-                 close_pnl=1.0):
+                 close_pnl=1.0, workdir=None, start_positions=None):
     """Run `ticks` loop iterations. Returns dict(tick_seconds of the first tick,
     llm_calls, orders, threads_seen, mt5_threads, error)."""
-    workdir = tempfile.mkdtemp()
+    workdir = workdir or tempfile.mkdtemp()
     old_cwd = os.getcwd()
     os.chdir(workdir)
     sys.modules["MetaTrader5"] = _fake_mt5_module()
@@ -111,7 +111,7 @@ def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None,
         if tick["n"] >= ticks:
             raise KeyboardInterrupt   # bot.run() treats this as a clean stop
 
-    open_positions = []      # orders stay open (never closed) in the harness
+    open_positions = list(start_positions or [])   # orders stay open until a test closes them
 
     def _place_order(**k):
         orders.append(k["symbol"])

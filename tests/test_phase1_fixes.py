@@ -450,7 +450,7 @@ class TestAdoptedPositionOpenTime(unittest.TestCase):
     def test_bot_uses_position_open_time(self):
         src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 "bot.py")).read()
-        self.assertIn('entry_time    = _opened or datetime.now(UTC)', src)
+        self.assertIn('entry_time    = _snap_time or _opened or datetime.now(UTC)', src)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

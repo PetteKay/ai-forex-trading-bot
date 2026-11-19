@@ -35,7 +35,7 @@ from strategy.position_sizing import compute_lot, kelly_fraction
 from agents.desk import run_desk
 from strategy.bar_gate import BarGate
 from memory.trade_learning import (classify_outcome, update_blacklist, save_training_sample,
-                                   lesson_fields, regime_of)
+                                   lesson_fields, json_safe_context)
 from strategy.correlation import _CORR_GROUPS, _check_correlation  # noqa: F401
 
 # Fix Windows console encoding so Unicode box-drawing chars don't crash the logger
@@ -337,20 +337,32 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
             log.warning(f"[{_pos['symbol']}] ticket {_ticket}: open time unavailable "
                         f"(market closed?) — using now; max-hold clock restarts.")
         if _ticket not in open_trades:
+            # Entry snapshot saved when the trade was opened (by bot.py or the MCP
+            # server): restores the context the lesson and ML sample need.
+            try:
+                _snap = memory.get_open_context(_ticket) or {}
+            except Exception:
+                _snap = {}
+            _snap_time = None
+            if _snap.get("entry_time"):
+                try:
+                    _snap_time = datetime.fromisoformat(_snap["entry_time"])
+                except Exception:
+                    _snap_time = None
             open_trades[_ticket] = OpenTradeRecord(
                 ticket        = _ticket,
                 symbol        = _pos["symbol"],
                 direction     = _pos["type"],
                 entry_price   = _pos["price"],
-                entry_context = {},
-                tech_analysis = {},
-                pm_decision   = {},
-                entry_time    = _opened or datetime.now(UTC),
-                atr           = 0.0,
+                entry_context = _snap.get("context", {}),
+                tech_analysis = _snap.get("tech", {}),
+                pm_decision   = _snap.get("pm", {}),
+                entry_time    = _snap_time or _opened or datetime.now(UTC),
+                atr           = float((_snap.get("context") or {}).get("atr", 0.0) or 0.0),
                 sl            = _pos["sl"],
                 tp            = _pos["tp"],
                 volume        = _pos["volume"],
-                risk_usd      = 0.0,
+                risk_usd      = float(_snap.get("risk_usd") or 0.0),
             )
     if _existing:
         log.info(f"Startup reconciliation: adopted {len(_existing)} orphaned position(s) from MT5.")
@@ -515,6 +527,11 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                     saved = memory.save(lesson_record)
                     if saved:
                         log.info(f"★ [{sym}] Lesson saved: {lesson_record['lesson'][:100]}")
+
+                try:
+                    memory.delete_open_context(ticket)
+                except Exception:
+                    pass
 
                 # ── ML training data: EVERY closed trade, not only saved lessons ──
                 # (memory/trade_learning.py — shared with the MCP server)
@@ -1535,6 +1552,17 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                                 volume        = adjusted_lot,
                                 risk_usd      = risk_usd,
                             )
+                            # Entry snapshot in the DB: survives restarts, and lets the
+                            # MCP server learn from this trade too if it books the close.
+                            try:
+                                memory.save_open_context(
+                                    result["ticket"], symbol=symbol, direction=action,
+                                    entry_time=open_trades[result["ticket"]].entry_time.isoformat(),
+                                    entry_price=result["price"], risk_usd=risk_usd,
+                                    context=json_safe_context(ctx), tech=tech, pm=pm,
+                                    source="bot", reason=pm.get("reasoning", ""))
+                            except Exception as _oc_err:
+                                log.warning(f"[{symbol}] Could not store entry snapshot: {_oc_err}")
                             journal.log_trade_open(
                                 ticket          = result["ticket"],
                                 symbol          = symbol,

@@ -67,3 +67,37 @@ class TestBotCloseLearning(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestEntrySnapshot(unittest.TestCase):
+    def test_snapshot_round_trip_keeps_features(self):
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        import numpy as np
+        from memory.trade_learning import json_safe_context
+        from strategy.indicators import feature_vector
+        ctx = {"price": np.float64(1.08), "rsi": np.float64(55.2), "fast_above_slow": np.bool_(True),
+               "price_above_trend": True, "macd_positive": np.bool_(False), "atr_percentile": 64,
+               "bb_pct": 0.4, "_df": object(), "regime": {"regime": "TRENDING_UP"}}
+        self.assertEqual(feature_vector(json_safe_context(ctx)), feature_vector(ctx))
+
+    def test_bot_stores_snapshot_and_restores_it_after_restart(self):
+        import config
+        r1 = run_one_tick(1, 0.0, buy_every=1, desk_workers=1, ticks=1)
+        self.assertEqual(r1["orders"], ["EURUSD"])
+        snap = _rows(r1["workdir"], config.MEMORY_DB_PATH, "SELECT * FROM open_trade_context")
+        self.assertEqual(len(snap), 1)
+        ticket = snap[0]["ticket"]
+        self.assertTrue(json.loads(snap[0]["context"]).get("rsi") is not None)
+        # Restart: the position is still open in MT5; tick 1 adopts it, then it closes.
+        pos = [{"ticket": ticket, "symbol": "EURUSD", "type": "BUY", "volume": 0.01,
+                "price": 1.1, "sl": 1.09, "tp": 1.12, "profit": 0.0, "time": 0}]
+        r2 = run_one_tick(1, 0.0, buy_every=0, desk_workers=1, ticks=2, workdir=r1["workdir"],
+                          start_positions=pos, on_tick_end=_close_all, close_pnl=-5.0,
+                          reflect_result=LESSON)
+        self.assertIsNone(r2["error"], r2["error"])
+        ml = _rows(r1["workdir"], config.MEMORY_DB_PATH, "SELECT * FROM ml_samples")
+        self.assertEqual([m["ticket"] for m in ml], [ticket],
+                         "adopted trade lost its entry context → no ML sample")
+        self.assertAlmostEqual(ml[0]["r_multiple"], -0.5)   # risk_usd restored (10)
+        self.assertEqual(_rows(r1["workdir"], config.MEMORY_DB_PATH,
+                               "SELECT * FROM open_trade_context"), [])
