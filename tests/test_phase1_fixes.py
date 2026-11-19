@@ -17,7 +17,28 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 logging.disable(logging.CRITICAL)
 
+import numpy as np    # noqa: E402  (imported up-front: numpy cannot be re-imported)
+import pandas as pd   # noqa: E402,F401
+
 from risk_governor import RiskGovernor  # noqa: E402
+
+
+def _install_fake_mt5(test, fake):
+    """Swap in a fake MetaTrader5 module for one test, restoring only that key."""
+    had = "MetaTrader5" in sys.modules
+    old = sys.modules.get("MetaTrader5")
+    sys.modules["MetaTrader5"] = fake
+    for mod in ("mt5_bridge", "position_manager"):
+        sys.modules.pop(mod, None)
+
+    def restore():
+        if had:
+            sys.modules["MetaTrader5"] = old
+        else:
+            sys.modules.pop("MetaTrader5", None)
+        for mod in ("mt5_bridge", "position_manager"):
+            sys.modules.pop(mod, None)
+    test.addCleanup(restore)
 
 
 def _gov(equity, path):
@@ -123,14 +144,12 @@ class TestKillSwitchKeepsRecordsForPnL(unittest.TestCase):
         import types
         from unittest import mock
         fake = self._fake_mt5()
-        with mock.patch.dict(sys.modules, {"MetaTrader5": fake}):
-            sys.modules.pop("mt5_bridge", None)
-            sys.modules.pop("position_manager", None)
-            import position_manager
-            with mock.patch.object(position_manager.mt5b, "close_position", return_value=True) as cp:
-                open_trades = {111: object(), 222: object()}
-                position_manager.PositionManager(types.SimpleNamespace()).close_all(
-                    open_trades, types.SimpleNamespace(MAGIC_NUMBER=1))
+        _install_fake_mt5(self, fake)
+        import position_manager
+        with mock.patch.object(position_manager.mt5b, "close_position", return_value=True) as cp:
+            open_trades = {111: object(), 222: object()}
+            position_manager.PositionManager(types.SimpleNamespace()).close_all(
+                open_trades, types.SimpleNamespace(MAGIC_NUMBER=1))
         self.assertEqual(cp.call_count, 2, "Both positions must be closed")
         self.assertEqual(set(open_trades), {111, 222},
                          "close_all removed the records, so their P&L could never be booked")
@@ -142,3 +161,38 @@ class TestKillSwitchKeepsRecordsForPnL(unittest.TestCase):
         guard  = src.index("# ── Kill-switch guard")
         self.assertLess(detect, guard,
                         "Kill guard skips the tick before closed trades are booked")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bug 3: signals were computed on the still-forming candle
+# MQL5 docs: bar index 0 is the current (unfinished) bar.
+# ─────────────────────────────────────────────────────────────────────────────
+class TestClosedCandlesOnly(unittest.TestCase):
+    def _bridge_with(self, calls):
+        import types
+        m = types.ModuleType("MetaTrader5")
+        m.__getattr__ = lambda name: 0
+        m.TIMEFRAME_H1 = 16385
+
+        def copy_rates_from_pos(symbol, tf, start, count):
+            calls.append(start)
+            dt = np.dtype([("time", "i8"), ("open", "f8"), ("high", "f8"), ("low", "f8"),
+                           ("close", "f8"), ("tick_volume", "i8")])
+            return np.array([(1_700_000_000 + i * 3600, 1, 1, 1, 1, 10) for i in range(count)], dtype=dt)
+        m.copy_rates_from_pos = copy_rates_from_pos
+        _install_fake_mt5(self, m)
+        import mt5_bridge
+        return mt5_bridge
+
+    def test_default_skips_forming_bar(self):
+        calls = []
+        b = self._bridge_with(calls)
+        df = b.get_candles("EURUSD", "H1", count=5)
+        self.assertEqual(calls, [1], "get_candles still asks MT5 for bar 0 (the forming candle)")
+        self.assertEqual(len(df), 5)
+
+    def test_forming_bar_only_on_request(self):
+        calls = []
+        b = self._bridge_with(calls)
+        b.get_candles("EURUSD", "H1", count=5, include_forming=True)
+        self.assertEqual(calls, [0])

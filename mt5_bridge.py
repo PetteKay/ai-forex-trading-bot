@@ -191,16 +191,23 @@ def get_risk_usd(symbol: str, entry_price: float, sl_price: float, volume: float
     return (abs(entry_price - sl_price) / pip_size) * pv
 
 
-def get_candles(symbol: str, timeframe: str, count: int = 200) -> pd.DataFrame:
+def get_candles(symbol: str, timeframe: str, count: int = 200,
+                include_forming: bool = False) -> pd.DataFrame:
     """
     Fetch the last `count` closed candles for a symbol.
     Returns a DataFrame with columns: time, open, high, low, close, volume
+
+    MT5 numbers bars from present to past and bar 0 is the current, still-forming
+    bar (MQL5 docs: copy_rates_from_pos / CopyRates). Starting at 1 returns only
+    closed bars, so signals do not change while the candle is still forming.
+    Pass include_forming=True only when the live bar is wanted on purpose.
     """
     tf = TIMEFRAME_MAP.get(timeframe.upper())
     if tf is None:
         raise ValueError(f"Unknown timeframe: {timeframe}")
 
-    rates = mt5.copy_rates_from_pos(symbol, tf, 0, count)
+    start_pos = 0 if include_forming else 1
+    rates = mt5.copy_rates_from_pos(symbol, tf, start_pos, count)
     if rates is None or len(rates) == 0:
         raise RuntimeError(f"No candle data for {symbol}: {mt5.last_error()}")
 
@@ -534,6 +541,14 @@ def is_connected() -> bool:
         return info is not None and info.connected
     except Exception:
         return False
+
+
+def get_live_price(symbol: str) -> float | None:
+    """Current bid (the price MT5 bars are built from), or None if no tick."""
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None or not getattr(tick, "bid", 0):
+        return None
+    return float(tick.bid)
 
 
 def get_spread_pips(symbol: str) -> float:

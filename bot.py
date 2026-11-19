@@ -622,6 +622,15 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                         log.warning(f"[{symbol}] Not enough candle data.")
                         continue
 
+                    # Signals come from closed candles; level-proximity checks
+                    # (S/R zones, pivots, key levels) use the live price, as they
+                    # did when the forming candle's close was the "price".
+                    try:
+                        _lp = mt5b.get_live_price(symbol)
+                    except Exception:
+                        _lp = None
+                    ctx["live_price"] = _lp or ctx["price"]
+
                     # ── 6. Regime classification ──────────────────────────────
                     regime_info = classify_regime(ctx["_df"], ctx["atr_percentile"])
                     ctx["regime"] = regime_info
@@ -739,7 +748,7 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                     if _SR_ZONES_AVAILABLE and getattr(config, "SR_ZONE_ENABLED", False):
                         try:
                             _sr_zones  = find_sr_zones(symbol, ctx["_df"])
-                            _sr_result = check_sr_zone(symbol, ctx["price"], _sr_zones)
+                            _sr_result = check_sr_zone(symbol, ctx["live_price"], _sr_zones)
                             if _sr_result["at_sr_zone"]:
                                 log.info(
                                     f"  SR Zone [{symbol}]: {_sr_result['zone_type']} @ "
@@ -764,7 +773,7 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                     _pivot_result = {"at_pivot": False}
                     if _PIVOT_LEVELS_AVAILABLE and getattr(config, "PIVOT_LEVELS_ENABLED", False):
                         try:
-                            _pivot_result = check_pivot_levels(symbol, ctx["price"], ctx["_df"])
+                            _pivot_result = check_pivot_levels(symbol, ctx["live_price"], ctx["_df"])
                             if _pivot_result["at_pivot"]:
                                 log.info(
                                     f"  Pivot [{symbol}]: {_pivot_result['pivot_type']} "
@@ -966,7 +975,7 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                             and getattr(config, "KEY_LEVEL_CHECK_ENABLED", False)
                             and action in ("BUY", "SELL")):
                         try:
-                            kl = check_key_levels(symbol, ctx["price"], ctx["_df"])
+                            kl = check_key_levels(symbol, ctx["live_price"], ctx["_df"])
                             if kl["at_key_level"]:
                                 aligned = (
                                     (action == "BUY"  and kl["signal_alignment"] == "SUPPORT") or
