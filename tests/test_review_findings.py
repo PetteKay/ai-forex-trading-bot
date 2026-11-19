@@ -10,8 +10,8 @@ Codex review findings on PR #4 / #5, reproduced and fixed.
 
 Run: py -m pytest tests/test_review_findings.py -v
 """
+import importlib
 import os
-import sqlite3
 import sys
 import tempfile
 import types
@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-import numpy as np    # noqa: E402,F401  (load once)
+importlib.import_module("numpy")   # load once, before any module juggling
 import bot_control as bc  # noqa: E402
 
 
