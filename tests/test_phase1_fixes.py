@@ -104,3 +104,41 @@ class TestGovernorSurvivesRestart(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bug 2: trades closed by the kill switch never had their P&L recorded
+# ─────────────────────────────────────────────────────────────────────────────
+class TestKillSwitchKeepsRecordsForPnL(unittest.TestCase):
+    def _fake_mt5(self):
+        import types
+        m = types.ModuleType("MetaTrader5")
+        m.__getattr__ = lambda name: 0          # any other MT5 constant
+        m.ORDER_TYPE_BUY = 0
+        pos = types.SimpleNamespace(type=0, symbol="EURUSD", volume=0.01)
+        m.positions_get = lambda ticket=None: [pos]
+        return m
+
+    def test_close_all_leaves_tickets_for_pnl_booking(self):
+        import types
+        from unittest import mock
+        fake = self._fake_mt5()
+        with mock.patch.dict(sys.modules, {"MetaTrader5": fake}):
+            sys.modules.pop("mt5_bridge", None)
+            sys.modules.pop("position_manager", None)
+            import position_manager
+            with mock.patch.object(position_manager.mt5b, "close_position", return_value=True) as cp:
+                open_trades = {111: object(), 222: object()}
+                position_manager.PositionManager(types.SimpleNamespace()).close_all(
+                    open_trades, types.SimpleNamespace(MAGIC_NUMBER=1))
+        self.assertEqual(cp.call_count, 2, "Both positions must be closed")
+        self.assertEqual(set(open_trades), {111, 222},
+                         "close_all removed the records, so their P&L could never be booked")
+
+    def test_closed_trade_detection_runs_before_kill_guard(self):
+        src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "bot.py")).read()
+        detect = src.index("# ── 3. Detect closed trades")
+        guard  = src.index("# ── Kill-switch guard")
+        self.assertLess(detect, guard,
+                        "Kill guard skips the tick before closed trades are booked")

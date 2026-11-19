@@ -389,18 +389,10 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                 f"Unrealised: {unrealised:+.2f} | Governor: {governor.status}"
             )
 
-            # ── Kill-switch guard ─────────────────────────────────────────
-            gov_status = governor.status
-            if gov_status["kill_active"] or gov_status["drawdown_halt"]:
-                halt_reason = "kill switch" if gov_status["kill_active"] else "drawdown halt"
-                if open_trades and not demo_mode:
-                    log.warning(f"Governor {halt_reason} ACTIVE — force-closing all open positions.")
-                    pos_manager.close_all(open_trades, config)
-                log.info(f"Governor {halt_reason} — skipping agent desk and sleeping.")
-                _sleep(tick_start)
-                continue
-
             # ── 3. Detect closed trades → get real P&L → reflect ─────────
+            # Runs BEFORE the kill-switch guard so trades closed by the kill switch
+            # (or by SL/TP while it is active) still have their real P&L recorded
+            # in the governor, journal and memory.
             closed_tickets = set(open_trades.keys()) - current_tickets
             for ticket in closed_tickets:
                 record    = open_trades.pop(ticket)
@@ -545,6 +537,17 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                                     _dynamic_min_confidence = _new_conf
                                 else:
                                     log.debug(f"AdaptiveConf: {_conf_reason}")
+
+            # ── Kill-switch guard ─────────────────────────────────────────
+            gov_status = governor.status
+            if gov_status["kill_active"] or gov_status["drawdown_halt"]:
+                halt_reason = "kill switch" if gov_status["kill_active"] else "drawdown halt"
+                if open_trades and not demo_mode:
+                    log.warning(f"Governor {halt_reason} ACTIVE — force-closing all open positions.")
+                    pos_manager.close_all(open_trades, config)
+                log.info(f"Governor {halt_reason} — skipping agent desk and sleeping.")
+                _sleep(tick_start)
+                continue
 
             # ── 4. Active position management (trailing SL etc.) ─────────
             if open_trades and not demo_mode:
