@@ -34,6 +34,7 @@ from datetime import datetime, UTC
 from strategy.position_sizing import compute_lot, kelly_fraction
 from agents.desk import run_desk
 from strategy.bar_gate import BarGate
+from strategy.correlation import _CORR_GROUPS, _check_correlation  # noqa: F401
 
 # Fix Windows console encoding so Unicode box-drawing chars don't crash the logger
 if hasattr(sys.stdout, "reconfigure"):
@@ -274,6 +275,7 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
         max_drawdown_pct     = config.MAX_DRAWDOWN_PCT,
         allowed_sessions     = config.ALLOWED_SESSIONS,
         state_path           = getattr(config, "GOVERNOR_STATE_PATH", "observability/governor_state.json"),
+        account_id           = mt5b.get_account_login(),
     )
     if reset_drawdown_halt:
         governor.reset_drawdown_halt(starting_equity)
@@ -664,7 +666,14 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
 
             # Stage 1 (main thread): data, filters, memory recall — all MT5 calls.
             _jobs: list[dict] = []
-            for symbol in symbols_list:
+            # Already at the position limit: no new trade is possible this tick,
+            # so don't spend LLM calls on desks (positions are managed above).
+            _scan_list = symbols_list
+            if open_count >= config.MAX_OPEN_POSITIONS:
+                log.info(f"At max open positions ({open_count}) — skipping the symbol scan.")
+                _funnel["max_positions"] = len(symbols_list)
+                _scan_list = []
+            for symbol in _scan_list:
                 _funnel["scanned"] += 1
 
                 try:
@@ -1003,8 +1012,10 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
 
             # Stage 3 (main thread, original symbol order): adjustments, gates,
             # Risk Manager, sizing, orders.
+            _decided: set[str] = set()
             for _job, _desk_fut in zip(_jobs, _desk_futs):
                 symbol = _job["symbol"]
+                _decided.add(symbol)
                 try:
                     ctx           = _job["ctx"]
                     regime_info   = _job["regime_info"]
@@ -1644,7 +1655,11 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                         exc_info=True,
                     )
                     continue
-            # A break (max positions reached) leaves later desks unused.
+            # A break (max positions reached) leaves later desks unused: release
+            # their candles so they are evaluated once capacity frees up.
+            for _job in _jobs:
+                if _job["symbol"] not in _decided:
+                    _bar_gate.retry(_job["symbol"])
             for _f in _desk_futs:
                 _f.cancel()
             _desk_pool.shutdown(wait=False, cancel_futures=True)
@@ -1681,53 +1696,6 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
             except Exception:
                 pass
         log.info("Bot shut down. Final memory: " + str(memory.stats()))
-
-
-# Pairs with correlation > 0.85 — verified: BIS 2022, FXNX 2026, Offbeat Forex
-# Format: { symbol: [correlated_symbols_with_same_direction_risk] }
-_CORR_GROUPS: dict[str, list[str]] = {
-    # USD-positive pairs (all move together when USD strengthens)
-    "USDCHF": ["USDCAD", "USDJPY"],
-    "USDCAD": ["USDCHF", "USDJPY"],
-    "USDJPY": ["USDCHF", "USDCAD"],
-    # USD-negative pairs (EURUSD and GBPUSD are +0.85 correlated)
-    "EURUSD": ["GBPUSD"],
-    "GBPUSD": ["EURUSD"],
-    # Commodity currencies (+0.90 correlated — never trade same direction)
-    "AUDUSD": ["NZDUSD"],
-    "NZDUSD": ["AUDUSD"],
-    # Metals (+0.80 correlated)
-    "XAUUSD": ["XAGUSD"],
-    "XAGUSD": ["XAUUSD"],
-    # Energy (+0.95 — treat as one instrument)
-    "USOIL":  ["UKOIL"],
-    "UKOIL":  ["USOIL"],
-    # US Equity Indices (+0.85–0.90)
-    "NAS100": ["SPX500", "US30"],
-    "SPX500": ["NAS100", "US30"],
-    "US30":   ["NAS100", "SPX500"],
-    # Crypto (+0.88)
-    "BTCUSD": ["ETHUSD"],
-    "ETHUSD": ["BTCUSD"],
-    # AUD/NZD JPY crosses (same commodity-currency driver)
-    "AUDJPY": ["NZDJPY"],
-    "NZDJPY": ["AUDJPY"],
-}
-
-
-def _check_correlation(symbol: str, action: str, open_trades: dict) -> str | None:
-    """
-    Return the correlated open symbol if adding `symbol` in `action` direction
-    would create duplicate economic exposure. Return None if clear.
-    """
-    # Strip broker suffix (.r / .pro / .a) — same normalisation the spread filter
-    # uses. Without this the guard silently never matches on suffixed brokers.
-    corr_peers = _CORR_GROUPS.get(symbol.upper().split(".")[0], [])
-    for peer in corr_peers:
-        for trade in open_trades.values():
-            if trade.symbol.upper().startswith(peer.upper()) and trade.direction == action:
-                return trade.symbol
-    return None
 
 
 def _ctx_to_query(ctx: dict, regime_info: dict) -> str:

@@ -139,6 +139,12 @@ def get_account_equity() -> float:
     return float(info.equity) if info else 0.0
 
 
+def get_account_login() -> str | None:
+    """MT5 account number of the logged-in account (None if unavailable)."""
+    info = mt5.account_info()
+    return str(info.login) if info and getattr(info, "login", None) else None
+
+
 def get_account_balance() -> float:
     """Realized balance only — excludes floating P&L of open positions."""
     info = mt5.account_info()

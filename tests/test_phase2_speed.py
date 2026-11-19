@@ -134,3 +134,29 @@ class TestOneEvaluationPerCandle(unittest.TestCase):
         self.assertIsNone(r["error"], r["error"])
         self.assertEqual(r["llm_calls"]["technical"], 3,
                          "agent desk re-ran on a candle it had already evaluated")
+
+
+class TestUnusedDesksReleaseTheirCandle(unittest.TestCase):
+    """Codex review on #2: a break at max positions must not lock later symbols out
+    of the rest of the candle."""
+
+    def test_symbols_cut_off_by_max_positions_are_evaluated_when_capacity_frees(self):
+        def close_the_position(n, cfg, positions):
+            if n == 1:
+                positions.clear()                # EURUSD hits TP → capacity frees up
+        r = run_one_tick(4, 0.05, buy_every=1, desk_workers=4, ticks=2,
+                         cfg_extra={"MAX_OPEN_POSITIONS": 1},
+                         on_tick_end=close_the_position)
+        self.assertIsNone(r["error"], r["error"])
+        # tick 1: EURUSD placed, limit hit. tick 2: EURUSD closed → the next
+        # symbol that was cut off (GBPUSD) is evaluated and placed.
+        self.assertEqual(r["orders"], ["EURUSD", "GBPUSD"],
+                         "symbols skipped after the break stayed locked for the candle")
+
+    def test_no_desks_when_already_at_max_positions(self):
+        r = run_one_tick(4, 0.05, buy_every=1, desk_workers=4, ticks=2,
+                         cfg_extra={"MAX_OPEN_POSITIONS": 1})
+        self.assertIsNone(r["error"], r["error"])
+        self.assertEqual(r["orders"], ["EURUSD"])
+        # tick 1: desks for up to 4 symbols; tick 2: at the limit, none
+        self.assertLessEqual(r["llm_calls"].get("technical", 0), 4)
