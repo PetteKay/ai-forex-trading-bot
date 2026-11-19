@@ -33,6 +33,7 @@ import sys
 from datetime import datetime, UTC
 from strategy.position_sizing import compute_lot, kelly_fraction
 from agents.desk import run_desk
+from strategy.bar_gate import BarGate
 
 # Fix Windows console encoding so Unicode box-drawing chars don't crash the logger
 if hasattr(sys.stdout, "reconfigure"):
@@ -300,6 +301,11 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
         max_bars_between=getattr(config, "CUSUM_MAX_BARS", 20),
         min_bars_between=getattr(config, "CUSUM_MIN_BARS", 3),
     ) if _CUSUM_AVAILABLE else None
+
+    # New-candle gate — the agent desk runs once per new closed candle per symbol
+    _bar_gate = BarGate()
+    # CUSUM decision cached per candle so its state advances once per candle
+    _cusum_bar: dict[str, tuple] = {}
 
     # HMM latent vol regime model — retrained daily alongside LightGBM
     _hmm_model    = HMMRegimeModel() if _HMM_AVAILABLE else None
@@ -683,6 +689,15 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                         log.warning(f"[{symbol}] Not enough candle data.")
                         continue
 
+                    # ── 5b. New-candle gate ───────────────────────────────────
+                    # Signals use closed candles; until a new one closes there is
+                    # nothing new for the agent desk to evaluate.
+                    _bar_t = df["time"].iloc[-1] if "time" in df.columns else df.index[-1]
+                    if (getattr(config, "EVALUATE_ON_NEW_BAR_ONLY", True)
+                            and _bar_gate.already_evaluated(symbol, _bar_t)):
+                        _funnel["same_candle"] = _funnel.get("same_candle", 0) + 1
+                        continue
+
                     # Signals come from closed candles; level-proximity checks
                     # (S/R zones, pivots, key levels) use the live price, as they
                     # did when the forming candle's close was the "price".
@@ -760,7 +775,11 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                         pass
 
                     if _cusum is not None and not getattr(config, "CUSUM_DISABLED", False):
-                        if not _cusum.should_evaluate(symbol, float(ctx.get("price", 0)), _atr_pct):
+                        # Advance CUSUM once per closed candle (its "bars" are candles).
+                        if _cusum_bar.get(symbol, (None,))[0] != _bar_t:
+                            _cusum_bar[symbol] = (_bar_t, _cusum.should_evaluate(
+                                symbol, float(ctx.get("price", 0)), _atr_pct))
+                        if not _cusum_bar[symbol][1]:
                             _funnel["cusum"] = _funnel.get("cusum", 0) + 1
                             continue
 
@@ -936,6 +955,7 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                     # The desk (LLM calls only) runs below on worker threads, several
                     # symbols at once. Everything above stays on the main thread.
                     _next_ev = calendar.next_event()
+                    _bar_gate.mark(symbol, _bar_t)
                     _jobs.append({
                         "symbol":          symbol,
                         "ctx":             ctx,
@@ -1329,6 +1349,7 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                         timing = check_entry_timing(m15_df, action, ctx.get("atr", 0.001))
                         log.info(f"  M15 timing: {timing['decision']} (quality={timing['quality']:.2f}) | {timing['reason']}")
                         if timing["decision"] == "WAIT":
+                            _bar_gate.retry(symbol)   # keep the old "re-evaluate next tick"
                             log.info(f"[{symbol}] M15 says WAIT — skipping this tick, re-evaluates next.")
                             _funnel["timing"] += 1
                             continue

@@ -472,8 +472,15 @@ STOCH_CONF_ADJ            = 3     # points added when stoch confirms direction
 # OR after CUSUM_MAX_BARS bars without any signal (time fallback).
 CUSUM_DISABLED       = False        # Set True to bypass (all ticks evaluated)
 CUSUM_H_PCT          = 0.004        # 0.4% price move threshold (≈40 pips EURUSD at 1.08)
-CUSUM_MAX_BARS       = 10           # Force evaluation after N ticks (~10 min); was 20 (20 min too slow for first trade)
-CUSUM_MIN_BARS       = 1            # Don't re-fire within N ticks of last signal (was 3)
+# The agent desk runs at most once per new CLOSED candle per symbol
+# (signals use closed candles, so nothing changes in between).
+EVALUATE_ON_NEW_BAR_ONLY = True
+# CUSUM now counts closed CANDLES, not 60-second ticks.
+# MAX_BARS = 1 → every new candle is evaluated (CUSUM cannot skip any).
+# Raise it (e.g. 3) to let CUSUM skip quiet candles: evaluate only after a move
+# of 0.5×ATR, or at least every N candles.
+CUSUM_MAX_BARS       = 1
+CUSUM_MIN_BARS       = 1
 
 # --- Yang-Zhang Vol Regime (via strategy/vol_estimators.py) ---
 # Adds vol_regime_label (QUIET/NORMAL/ELEVATED/EXTREME) to regime_info context.

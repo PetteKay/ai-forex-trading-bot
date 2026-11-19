@@ -112,3 +112,25 @@ class TestSharedFetchesUnderParallelDesks(unittest.TestCase):
             [t.start() for t in ts]; [t.join() for t in ts]
             mc.get_macro_context("GBPUSD")
         self.assertEqual(len(n), 1, f"macro fetch ran {len(n)} times")
+
+
+class TestOneEvaluationPerCandle(unittest.TestCase):
+    def test_bar_gate(self):
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from strategy.bar_gate import BarGate
+        g = BarGate()
+        self.assertFalse(g.already_evaluated("EURUSD", 1))
+        g.mark("EURUSD", 1)
+        self.assertTrue(g.already_evaluated("EURUSD", 1))
+        self.assertFalse(g.already_evaluated("EURUSD", 2))     # new candle
+        g.retry("EURUSD")
+        self.assertFalse(g.already_evaluated("EURUSD", 1))
+
+    def test_same_candle_not_reevaluated_across_ticks(self):
+        # 12 ticks (12 minutes) on one unchanged closed candle, CUSUM on with the
+        # previous defaults (force evaluation every 10 ticks).
+        r = run_one_tick(3, 0.0, buy_every=0, ticks=12, cfg_extra={
+            "CUSUM_DISABLED": False, "CUSUM_MAX_BARS": 10, "CUSUM_MIN_BARS": 1})
+        self.assertIsNone(r["error"], r["error"])
+        self.assertEqual(r["llm_calls"]["technical"], 3,
+                         "agent desk re-ran on a candle it had already evaluated")

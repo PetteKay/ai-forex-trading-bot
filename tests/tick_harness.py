@@ -51,8 +51,10 @@ def _bars(n, freq, seed):
     return df.set_index("time", drop=False)
 
 
-def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None):
-    """Returns dict(tick_seconds, llm_calls, orders, threads_seen, error)."""
+def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None,
+                 ticks=1, cfg_extra=None):
+    """Run `ticks` loop iterations. Returns dict(tick_seconds of the first tick,
+    llm_calls, orders, threads_seen, mt5_threads, error)."""
     workdir = tempfile.mkdtemp()
     old_cwd = os.getcwd()
     os.chdir(workdir)
@@ -88,7 +90,7 @@ def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None):
     def _pm(*a, **k):
         sym = k["ctx"].get("symbol") or ""
         i = symbols.index(sym) if sym in symbols else 0
-        if i % buy_every == 0:
+        if buy_every and i % buy_every == 0:
             return {"action": "BUY", "confidence": 85, "reasoning": "harness",
                     "bull_bear_verdict": "BULL"}
         return {"action": "HOLD", "confidence": 40, "reasoning": "harness"}
@@ -100,8 +102,11 @@ def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None):
     tick = {"start": None, "end": None}
 
     def _sleep(tick_start):
-        tick["end"] = time.perf_counter()
-        raise KeyboardInterrupt   # bot.run() treats this as a clean stop
+        tick["n"] = tick.get("n", 0) + 1
+        if tick["end"] is None:
+            tick["end"] = time.perf_counter()
+        if tick["n"] >= ticks:
+            raise KeyboardInterrupt   # bot.run() treats this as a clean stop
 
     def _place_order(**k):
         orders.append(k["symbol"])
@@ -119,6 +124,7 @@ def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None):
                     DISCOVERED_SIGNALS_ENABLED=False)
     if desk_workers is not None:
         cfg_over["DESK_PARALLELISM"] = desk_workers
+    cfg_over.update(cfg_extra or {})
 
     patches = [mock.patch.object(config, k, v, create=True) for k, v in cfg_over.items()]
     mb = bot.mt5b
