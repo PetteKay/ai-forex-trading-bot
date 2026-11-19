@@ -57,6 +57,11 @@ LLM_BASE_URL = "https://integrate.api.nvidia.com/v1"
 LLM_SEED           = 42     # Fixed seed for reproducible LLM outputs (where supported)
 LLM_MAX_TOKENS     = 1000   # Max tokens in LLM response (1000 is ample for JSON; 2048 caused 6-min hangs)
 LLM_TIMEOUT_SECONDS = 30    # Hard timeout per LLM call — prevents MT5 IPC disconnect during slow responses
+# Agent desks (Technical, Bear, News, Fund Manager) for this many symbols run
+# at the same time. All MT5 calls stay on the main thread. Higher = faster ticks
+# but more simultaneous LLM requests; lower it if your provider rate-limits you.
+# 1 = one symbol at a time (the original behaviour).
+DESK_PARALLELISM   = 3
 
 # --- Per-agent model overrides (optional) ---
 # Use a stronger model for the most critical decision-makers.
@@ -467,8 +472,15 @@ STOCH_CONF_ADJ            = 3     # points added when stoch confirms direction
 # OR after CUSUM_MAX_BARS bars without any signal (time fallback).
 CUSUM_DISABLED       = False        # Set True to bypass (all ticks evaluated)
 CUSUM_H_PCT          = 0.004        # 0.4% price move threshold (≈40 pips EURUSD at 1.08)
-CUSUM_MAX_BARS       = 10           # Force evaluation after N ticks (~10 min); was 20 (20 min too slow for first trade)
-CUSUM_MIN_BARS       = 1            # Don't re-fire within N ticks of last signal (was 3)
+# The agent desk runs at most once per new CLOSED candle per symbol
+# (signals use closed candles, so nothing changes in between).
+EVALUATE_ON_NEW_BAR_ONLY = True
+# CUSUM now counts closed CANDLES, not 60-second ticks.
+# MAX_BARS = 1 → every new candle is evaluated (CUSUM cannot skip any).
+# Raise it (e.g. 3) to let CUSUM skip quiet candles: evaluate only after a move
+# of 0.5×ATR, or at least every N candles.
+CUSUM_MAX_BARS       = 1
+CUSUM_MIN_BARS       = 1
 
 # --- Yang-Zhang Vol Regime (via strategy/vol_estimators.py) ---
 # Adds vol_regime_label (QUIET/NORMAL/ELEVATED/EXTREME) to regime_info context.

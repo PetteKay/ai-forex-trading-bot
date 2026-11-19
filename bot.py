@@ -32,6 +32,8 @@ import os
 import sys
 from datetime import datetime, UTC
 from strategy.position_sizing import compute_lot, kelly_fraction
+from agents.desk import run_desk
+from strategy.bar_gate import BarGate
 
 # Fix Windows console encoding so Unicode box-drawing chars don't crash the logger
 if hasattr(sys.stdout, "reconfigure"):
@@ -54,6 +56,14 @@ from agents import technical_analyst, portfolio_manager, reflection
 from agents import bear as bear_analyst
 from agents import news_analyst
 from agents import risk_manager as risk_mgr_agent
+
+# LLM agents used by the parallel agent desk (agents/desk.py)
+_DESK_AGENTS = {
+    "technical":         technical_analyst,
+    "bear":              bear_analyst,
+    "news":              news_analyst,
+    "portfolio_manager": portfolio_manager,
+}
 from data.news_feed import fetch_headlines
 try:
     from data.macro_context import get_macro_context, macro_summary_for_llm
@@ -291,6 +301,11 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
         max_bars_between=getattr(config, "CUSUM_MAX_BARS", 20),
         min_bars_between=getattr(config, "CUSUM_MIN_BARS", 3),
     ) if _CUSUM_AVAILABLE else None
+
+    # New-candle gate — the agent desk runs once per new closed candle per symbol
+    _bar_gate = BarGate()
+    # CUSUM decision cached per candle so its state advances once per candle
+    _cusum_bar: dict[str, tuple] = {}
 
     # HMM latent vol regime model — retrained daily alongside LightGBM
     _hmm_model    = HMMRegimeModel() if _HMM_AVAILABLE else None
@@ -647,6 +662,8 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                 "duplicate": 0, "correlation": 0, "governor": 0, "placed": 0,
             }
 
+            # Stage 1 (main thread): data, filters, memory recall — all MT5 calls.
+            _jobs: list[dict] = []
             for symbol in symbols_list:
                 _funnel["scanned"] += 1
 
@@ -670,6 +687,15 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
 
                     if not ctx:
                         log.warning(f"[{symbol}] Not enough candle data.")
+                        continue
+
+                    # ── 5b. New-candle gate ───────────────────────────────────
+                    # Signals use closed candles; until a new one closes there is
+                    # nothing new for the agent desk to evaluate.
+                    _bar_t = df["time"].iloc[-1] if "time" in df.columns else df.index[-1]
+                    if (getattr(config, "EVALUATE_ON_NEW_BAR_ONLY", True)
+                            and _bar_gate.already_evaluated(symbol, _bar_t)):
+                        _funnel["same_candle"] = _funnel.get("same_candle", 0) + 1
                         continue
 
                     # Signals come from closed candles; level-proximity checks
@@ -749,7 +775,11 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                         pass
 
                     if _cusum is not None and not getattr(config, "CUSUM_DISABLED", False):
-                        if not _cusum.should_evaluate(symbol, float(ctx.get("price", 0)), _atr_pct):
+                        # Advance CUSUM once per closed candle (its "bars" are candles).
+                        if _cusum_bar.get(symbol, (None,))[0] != _bar_t:
+                            _cusum_bar[symbol] = (_bar_t, _cusum.should_evaluate(
+                                symbol, float(ctx.get("price", 0)), _atr_pct))
+                        if not _cusum_bar[symbol][1]:
                             _funnel["cusum"] = _funnel.get("cusum", 0) + 1
                             continue
 
@@ -921,92 +951,84 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                             except Exception as _hmm_pe:
                                 log.debug(f"HMM predict error: {_hmm_pe}")
 
-                    # ── 10. Run 5-agent desk ──────────────────────────────────
-                    log.info(f"[{symbol}] ─── Agent Desk ───")
+                    # ── 10. Queue the agent desk ──────────────────────────────
+                    # The desk (LLM calls only) runs below on worker threads, several
+                    # symbols at once. Everything above stays on the main thread.
+                    _next_ev = calendar.next_event()
+                    _bar_gate.mark(symbol, _bar_t)
+                    _jobs.append({
+                        "symbol":          symbol,
+                        "ctx":             ctx,
+                        "regime_info":     regime_info,
+                        "memories":        memories,
+                        "agent_accuracy":  _agent_acc,
+                        "upcoming_events": [_next_ev] if _next_ev else [],
+                        "extra_signals": {
+                            "cot_signal":           _cot_signal.get("signal", "NEUTRAL"),
+                            "econ_surprise_signal": _econ_signal.get("signal", "NEUTRAL"),
+                            "fib_label":            "",   # filled after the key-level check
+                            "sr_zone_type":         _sr_result.get("zone_type", ""),
+                            "sr_zone_strength":     _sr_result.get("zone_strength", 0.0),
+                        },
+                        # used after the desk (stage 3)
+                        "m15_df": m15_df, "fp": fp, "fv": fv,
+                        "_cot_signal": _cot_signal, "_econ_signal": _econ_signal,
+                        "_sr_result": _sr_result, "_pivot_result": _pivot_result,
+                        "_sl_base_mult": _sl_base_mult, "_tp_base_mult": _tp_base_mult,
+                        "_bear_veto": _bear_veto,
+                    })
 
-                    log.info(f"[{symbol}] [1/5] Technical Analyst...")
-                    tech = technical_analyst.analyse(ctx, config)
-                    log.info(
-                        f"  Bull: {tech.get('bias','?')} ({tech.get('bias_strength','?')}/10) | "
-                        f"{tech.get('summary','')[:80]}"
+                except Exception as _sym_err:
+                    # Error boundary: one symbol failing must never kill the whole
+                    # trading loop — log it, count it, move to the next symbol.
+                    _funnel["error"] = _funnel.get("error", 0) + 1
+                    log.error(
+                        f"[{symbol}] Unhandled error in symbol scan — skipping this symbol: {_sym_err}",
+                        exc_info=True,
                     )
+                    continue
 
-                    # Prepare news inputs before parallel execution
-                    next_event     = calendar.next_event()
-                    upcoming_list  = [next_event] if next_event else []
-                    live_headlines = fetch_headlines(symbol)
-                    if live_headlines:
-                        log.info(f"  Live headlines: {len(live_headlines)} | Top: {live_headlines[0][:80]}")
-                    live_macro = {}
-                    if _MACRO_AVAILABLE:
-                        try:
-                            live_macro = get_macro_context(symbol)
-                            log.info(
-                                f"  Live macro: VIX={live_macro.get('vix','?')} "
-                                f"[{live_macro.get('vix_regime','?')}] | "
-                                f"DXY={live_macro.get('dxy','?')} [{live_macro.get('dxy_trend','?')}] | "
-                                f"F&G={live_macro.get('fear_greed_score','?')}"
-                            )
-                        except Exception as _me:
-                            log.debug(f"Macro fetch skipped: {_me}")
+            # Stage 2 (worker threads): agent desks — LLM calls only, no MT5.
+            _desk_workers = max(1, int(getattr(config, "DESK_PARALLELISM", 3)))
+            _desk_pool = ThreadPoolExecutor(max_workers=_desk_workers, thread_name_prefix="desk")
+            _desk_futs = [
+                _desk_pool.submit(
+                    run_desk, _job, config, _DESK_AGENTS, fetch_headlines,
+                    get_macro_context if _MACRO_AVAILABLE else None,
+                )
+                for _job in _jobs
+            ]
+            if _jobs:
+                log.info(f"Agent desks: {len(_jobs)} symbol(s), {_desk_workers} at a time")
 
-                    log.info(f"[{symbol}] [2+3/5] Bear + News Analysts (parallel)...")
-                    with ThreadPoolExecutor(max_workers=2) as _pool:
-                        _bear_fut = _pool.submit(bear_analyst.analyse, ctx, tech, config)
-                        _news_fut = _pool.submit(lambda: news_analyst.analyse(
-                            symbol          = symbol,
-                            sessions        = ctx.get("sessions", []),
-                            upcoming_events = upcoming_list,
-                            cfg             = config,
-                            news_snippets   = live_headlines or None,
-                            macro           = live_macro or None,
-                        ))
-                        try:
-                            bear = _bear_fut.result()
-                        except Exception as _be:
-                            log.warning(f"[{symbol}] Bear analyst failed: {_be} — using safe default")
-                            bear = {"bear_thesis": "Analysis unavailable.", "risk_score": 5,
-                                    "evidence": [], "counter_to_bull": "Unknown", "regime_warning": ""}
-                        try:
-                            macro = _news_fut.result()
-                        except Exception as _ne:
-                            log.warning(f"[{symbol}] News analyst failed: {_ne} — using safe default")
-                            macro = {"macro_tone": "NEUTRAL", "news_risk": 5, "key_themes": [],
-                                     "session_bias": "NEUTRAL", "recommendation": "HOLD"}
+            # Stage 3 (main thread, original symbol order): adjustments, gates,
+            # Risk Manager, sizing, orders.
+            for _job, _desk_fut in zip(_jobs, _desk_futs):
+                symbol = _job["symbol"]
+                try:
+                    ctx           = _job["ctx"]
+                    regime_info   = _job["regime_info"]
+                    m15_df        = _job["m15_df"]
+                    fp, fv        = _job["fp"], _job["fv"]
+                    _cot_signal   = _job["_cot_signal"]
+                    _econ_signal  = _job["_econ_signal"]
+                    _sr_result    = _job["_sr_result"]
+                    _pivot_result = _job["_pivot_result"]
+                    _sl_base_mult = _job["_sl_base_mult"]
+                    _tp_base_mult = _job["_tp_base_mult"]
+                    _bear_veto    = _job["_bear_veto"]
+                    _extra_signals_for_pm = _job["extra_signals"]
 
-                    log.info(
-                        f"  Bear risk: {bear.get('risk_score','?')}/10 | "
-                        f"{bear.get('bear_thesis','')[:80]}"
-                    )
-                    log.info(
-                        f"  Macro: {macro.get('macro_tone','?')} | "
-                        f"News risk: {macro.get('news_risk','?')} | "
-                        f"DXY impact: {macro.get('dxy_impact','?')[:60]}"
-                    )
-
-                    log.info(f"[{symbol}] [4/5] Fund Manager (arbitrates bull vs bear)...")
-                    _extra_signals_for_pm = {
-                        "cot_signal":           _cot_signal.get("signal", "NEUTRAL"),
-                        "econ_surprise_signal": _econ_signal.get("signal", "NEUTRAL"),
-                        "fib_label":            "",   # filled below after key_level check
-                        "sr_zone_type":         _sr_result.get("zone_type", ""),
-                        "sr_zone_strength":     _sr_result.get("zone_strength", 0.0),
-                    }
-                    pm = portfolio_manager.decide(
-                        technical_analysis = tech,
-                        bear_analysis      = bear,
-                        news_analysis      = macro,
-                        past_memories      = memories,
-                        ctx                = ctx,
-                        regime             = regime_info,
-                        cfg                = config,
-                        agent_accuracy     = _agent_acc,
-                        extra_signals      = _extra_signals_for_pm,
-                    )
+                    _desk      = _desk_fut.result()
+                    tech       = _desk["tech"]
+                    bear       = _desk["bear"]
+                    macro      = _desk["macro"]
+                    pm         = _desk["pm"]
+                    live_macro = _desk["live_macro"]
                     action     = pm.get("action", "HOLD")
                     confidence = pm.get("confidence", 0)
                     log.info(
-                        f"  Decision: {action} ({confidence}%) | "
+                        f"[{symbol}]   Decision: {action} ({confidence}%) | "
                         f"Verdict: {pm.get('bull_bear_verdict','?')} | "
                         f"{pm.get('reasoning','')[:100]}"
                     )
@@ -1277,22 +1299,6 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                     ctx["cot_z_score"]   = _cot_signal.get("z_score", 0.0)
                     ctx["econ_surprise"] = _econ_signal.get("net_surprise", 0.0)
 
-                    log.info(f"[{symbol}] [5/5] Risk Manager...")
-                    risk_assessment = risk_mgr_agent.assess(
-                        ctx            = ctx,
-                        tech_analysis  = tech,
-                        bear_analysis  = bear,
-                        news_analysis  = macro,
-                        pm_decision    = pm,
-                        regime         = regime_info,
-                        cfg            = config,
-                    )
-                    log.info(
-                        f"  Qualified: {risk_assessment.get('trade_qualified')} | "
-                        f"Size: {risk_assessment.get('size_multiplier',1.0):.0%} | "
-                        f"Veto: {risk_assessment.get('veto_reason','none')}"
-                    )
-
                     # ── 11. Meta-label gate (24 features) ────────────────────
                     ml_result = meta_gate.predict(
                         fv, ctx,
@@ -1343,14 +1349,10 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                         timing = check_entry_timing(m15_df, action, ctx.get("atr", 0.001))
                         log.info(f"  M15 timing: {timing['decision']} (quality={timing['quality']:.2f}) | {timing['reason']}")
                         if timing["decision"] == "WAIT":
+                            _bar_gate.retry(symbol)   # keep the old "re-evaluate next tick"
                             log.info(f"[{symbol}] M15 says WAIT — skipping this tick, re-evaluates next.")
                             _funnel["timing"] += 1
                             continue
-
-                    if not risk_assessment.get("trade_qualified", False):
-                        log.info(f"[{symbol}] Risk Manager VETOED: {risk_assessment.get('veto_reason')}")
-                        _funnel["risk_veto"] += 1
-                        continue
 
                     if not ml_pass:
                         log.info(
@@ -1404,6 +1406,31 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                         # If we're at the max-positions limit, no point scanning more symbols
                         if open_count >= config.MAX_OPEN_POSITIONS:
                             break
+                        continue
+
+                    # ── Risk Manager LLM — only for trades that passed every free gate ──
+                    # All gates above are independent of the Risk Manager's answer, so
+                    # running them first gives the same decisions while skipping the
+                    # LLM call for HOLDs and blocked trades.
+                    log.info(f"[{symbol}] [5/5] Risk Manager...")
+                    risk_assessment = risk_mgr_agent.assess(
+                        ctx            = ctx,
+                        tech_analysis  = tech,
+                        bear_analysis  = bear,
+                        news_analysis  = macro,
+                        pm_decision    = pm,
+                        regime         = regime_info,
+                        cfg            = config,
+                    )
+                    log.info(
+                        f"  Qualified: {risk_assessment.get('trade_qualified')} | "
+                        f"Size: {risk_assessment.get('size_multiplier',1.0):.0%} | "
+                        f"Veto: {risk_assessment.get('veto_reason','none')}"
+                    )
+
+                    if not risk_assessment.get("trade_qualified", False):
+                        log.info(f"[{symbol}] Risk Manager VETOED: {risk_assessment.get('veto_reason')}")
+                        _funnel["risk_veto"] += 1
                         continue
 
                     # ── 14. Place order ───────────────────────────────────────
@@ -1617,6 +1644,10 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                         exc_info=True,
                     )
                     continue
+            # A break (max positions reached) leaves later desks unused.
+            for _f in _desk_futs:
+                _f.cancel()
+            _desk_pool.shutdown(wait=False, cancel_futures=True)
             # ── End of per-symbol scan ────────────────────────────────────
             # Log filter funnel — tells you exactly what blocked each symbol
             _active = {k: v for k, v in _funnel.items() if v > 0}
