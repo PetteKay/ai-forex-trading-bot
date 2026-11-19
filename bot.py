@@ -34,6 +34,7 @@ from datetime import datetime, UTC
 from strategy.position_sizing import compute_lot, kelly_fraction
 from agents.desk import run_desk
 from strategy.bar_gate import BarGate
+from strategy.correlation import _CORR_GROUPS, _check_correlation  # noqa: F401
 
 # Fix Windows console encoding so Unicode box-drawing chars don't crash the logger
 if hasattr(sys.stdout, "reconfigure"):
@@ -1681,53 +1682,6 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
             except Exception:
                 pass
         log.info("Bot shut down. Final memory: " + str(memory.stats()))
-
-
-# Pairs with correlation > 0.85 — verified: BIS 2022, FXNX 2026, Offbeat Forex
-# Format: { symbol: [correlated_symbols_with_same_direction_risk] }
-_CORR_GROUPS: dict[str, list[str]] = {
-    # USD-positive pairs (all move together when USD strengthens)
-    "USDCHF": ["USDCAD", "USDJPY"],
-    "USDCAD": ["USDCHF", "USDJPY"],
-    "USDJPY": ["USDCHF", "USDCAD"],
-    # USD-negative pairs (EURUSD and GBPUSD are +0.85 correlated)
-    "EURUSD": ["GBPUSD"],
-    "GBPUSD": ["EURUSD"],
-    # Commodity currencies (+0.90 correlated — never trade same direction)
-    "AUDUSD": ["NZDUSD"],
-    "NZDUSD": ["AUDUSD"],
-    # Metals (+0.80 correlated)
-    "XAUUSD": ["XAGUSD"],
-    "XAGUSD": ["XAUUSD"],
-    # Energy (+0.95 — treat as one instrument)
-    "USOIL":  ["UKOIL"],
-    "UKOIL":  ["USOIL"],
-    # US Equity Indices (+0.85–0.90)
-    "NAS100": ["SPX500", "US30"],
-    "SPX500": ["NAS100", "US30"],
-    "US30":   ["NAS100", "SPX500"],
-    # Crypto (+0.88)
-    "BTCUSD": ["ETHUSD"],
-    "ETHUSD": ["BTCUSD"],
-    # AUD/NZD JPY crosses (same commodity-currency driver)
-    "AUDJPY": ["NZDJPY"],
-    "NZDJPY": ["AUDJPY"],
-}
-
-
-def _check_correlation(symbol: str, action: str, open_trades: dict) -> str | None:
-    """
-    Return the correlated open symbol if adding `symbol` in `action` direction
-    would create duplicate economic exposure. Return None if clear.
-    """
-    # Strip broker suffix (.r / .pro / .a) — same normalisation the spread filter
-    # uses. Without this the guard silently never matches on suffixed brokers.
-    corr_peers = _CORR_GROUPS.get(symbol.upper().split(".")[0], [])
-    for peer in corr_peers:
-        for trade in open_trades.values():
-            if trade.symbol.upper().startswith(peer.upper()) and trade.direction == action:
-                return trade.symbol
-    return None
 
 
 def _ctx_to_query(ctx: dict, regime_info: dict) -> str:

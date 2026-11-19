@@ -192,6 +192,10 @@ backtester (`backtest/`).
 
 ---
 
+## Use it from Claude, Codex or ChatGPT (MCP)
+
+`mcp_server.py` lets Claude Code, Claude Desktop, OpenAI Codex, ChatGPT or any MCP client analyse the market and trade through the bot's risk governor and guards. The client's own model does the reasoning, so no LLM API key is needed in this mode. Trading is dry-run by default. Setup: **[MCP.md](MCP.md)**.
+
 ## Project layout
 
 ```

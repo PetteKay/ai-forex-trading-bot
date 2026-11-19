@@ -493,3 +493,14 @@ VOL_ESTIMATOR_ENABLED = True
 HMM_REGIME_ENABLED        = True
 HMM_SIZE_REDUCTION        = 0.70    # Lot size multiplier in HIGH_VOL state
 HMM_TRANS_TO_HIGH_THRESH  = 0.40   # Transition probability threshold for size cut
+
+# --- MCP server (mcp_server.py) ---
+# Lets Claude, Codex, ChatGPT or another MCP client analyse and trade through
+# the bot's risk governor. See MCP.md.
+#   "off"      trading tools refuse
+#   "dry_run"  place_trade / close_position only report what they would do
+#   "live"     orders are sent to the logged-in MT5 account
+MCP_TRADING_MODE       = "dry_run"
+# Trading over the HTTP transport (ChatGPT via a public HTTPS tunnel) is off
+# unless you set this to True. Read-only tools still work.
+MCP_HTTP_ALLOW_TRADING = False
