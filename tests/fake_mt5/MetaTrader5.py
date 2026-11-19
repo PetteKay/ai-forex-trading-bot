@@ -15,11 +15,37 @@ ORDER_FILLING_FOK, ORDER_FILLING_IOC, ORDER_FILLING_RETURN = 0, 1, 2
 ORDER_TIME_GTC = 0
 TRADE_ACTION_DEAL, TRADE_ACTION_SLTP = 1, 6
 TRADE_RETCODE_DONE = 10009
+DEAL_ENTRY_IN, DEAL_ENTRY_OUT = 0, 1
 
 _SYMBOLS = {"EURUSD": 1.0850, "GBPUSD": 1.2700, "USDJPY": 150.20, "AUDUSD": 0.6600}
 _positions: list = []
 _next_ticket = [5000]
 orders_sent: list = []           # tests can inspect this
+_deals: dict = {}                # position ticket -> [entry deal, exit deal]
+next_close_profit = [0.0]        # tests set the P&L of the next close
+
+
+def _record_close(pos, profit):
+    now = int(_time.time())
+    _deals[pos.ticket] = [
+        _NS(position_id=pos.ticket, entry=DEAL_ENTRY_IN, time=pos.time, price=pos.price_open,
+            volume=pos.volume, profit=0.0, swap=0.0, commission=0.0),
+        _NS(position_id=pos.ticket, entry=DEAL_ENTRY_OUT, time=now, price=pos.price_open,
+            volume=pos.volume, profit=profit, swap=0.0, commission=0.0)]
+
+
+def stop_out(ticket, profit):
+    """Simulate the broker closing a position at its stop loss / take profit."""
+    for p in list(_positions):
+        if p.ticket == ticket:
+            _positions.remove(p)
+            _record_close(p, profit)
+
+
+def history_deals_get(*a, position=None, **k):
+    if position is not None:
+        return tuple(_deals.get(position, ()))
+    return tuple(d for ds in _deals.values() for d in ds)
 
 
 def __getattr__(name):           # any other constant
@@ -83,7 +109,10 @@ def order_send(req):
     if req.get("action") != TRADE_ACTION_DEAL:
         return _NS(retcode=TRADE_RETCODE_DONE, order=0)
     if "position" in req:                     # close
-        _positions[:] = [p for p in _positions if p.ticket != req["position"]]
+        for p in list(_positions):
+            if p.ticket == req["position"]:
+                _positions.remove(p)
+                _record_close(p, next_close_profit[0])
         return _NS(retcode=TRADE_RETCODE_DONE, order=req["position"])
     _next_ticket[0] += 1
     t = _next_ticket[0]

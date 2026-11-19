@@ -26,7 +26,8 @@ You ── "Analyse EURUSD and trade it if it qualifies" ──► Claude / Code
 | `SIZING_MODE` / `RISK_PER_TRADE_PCT` | `"fixed"` / `0.5` | Same sizing as the bot. `"risk_pct"` sizes every trade to a % of equity. |
 
 Every `place_trade`, live or dry run, is checked against:
-- the **risk governor** (daily loss cap, kill switch, drawdown halt, max positions and orders per day). It reads `observability/governor_state.json`, so limits hit by the bot also block the MCP server, and the other way round.
+- the **risk governor** (daily loss cap, kill switch, drawdown halt, max positions and orders per day). It reads `observability/governor_state_<account>.json`, so limits hit by the bot also block the MCP server, and the other way round. Each MT5 account has its own file.
+  - Closed trades are booked before every check, including ones closed by `close_position`, by their stop loss / take profit, or while the server was off. So a losing close counts toward the daily loss cap.
 - the **economic-calendar blackout**
 - the **duplicate** and **correlation** guards
 - the **spread filter** (if enabled)

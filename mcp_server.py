@@ -145,7 +145,65 @@ def _governor(equity: float) -> RiskGovernor:
         max_drawdown_pct   = config.MAX_DRAWDOWN_PCT,
         allowed_sessions   = config.ALLOWED_SESSIONS,
         state_path         = getattr(config, "GOVERNOR_STATE_PATH", "observability/governor_state.json"),
+        account_id         = mt5b.get_account_login(),
     )
+
+
+def _book_closed_trades(gov: RiskGovernor) -> list[dict]:
+    """
+    Book trades that have closed since the last check — closed by close_position,
+    by their stop loss / take profit, or while the server was not running — so
+    the governor's daily loss cap sees the real result (as bot.py does).
+
+    Source: journal rows still OPEN whose ticket is no longer an open MT5
+    position. Each is booked once (the journal row is then CLOSED). Its P&L
+    counts toward today's limit only if the trade closed today (UTC).
+    """
+    from datetime import datetime, timezone
+    journal = _journal()
+    with _MT5_LOCK:
+        open_now = {p["ticket"] for p in mt5b.get_all_open_positions(_magic())}
+    booked = []
+    today = datetime.now(timezone.utc).date()
+    for row in journal.get_recent_trades(200):
+        if row.get("status") != "OPEN" or row["ticket"] in open_now:
+            continue
+        with _MT5_LOCK:
+            closed = mt5b.get_closed_trade(row["ticket"], max_wait_secs=0)
+        if not closed:
+            continue          # history not available yet — try again next time
+        net = float(closed.get("net_pnl", 0.0))
+        exit_utc = None
+        try:
+            et = closed.get("exit_time")
+            if et is not None:
+                ts = et.replace(tzinfo=timezone.utc).timestamp() if et.tzinfo is None else et.timestamp()
+                with _MT5_LOCK:
+                    exit_utc = mt5b.terminal_time_to_utc(int(ts), row["symbol"])
+        except Exception:
+            exit_utc = None
+        if exit_utc is not None:
+            counts_today = exit_utc.date() == today
+        else:   # offset not measurable (market closed): fall back to the entry date
+            counts_today = str(row.get("entry_time", ""))[:10] == today.isoformat()
+        try:
+            hold = 0.0
+            if row.get("entry_time"):
+                hold = (datetime.now(timezone.utc)
+                        - datetime.fromisoformat(row["entry_time"])).total_seconds() / 3600
+        except Exception:
+            hold = 0.0
+        journal.log_trade_close(ticket=row["ticket"], exit_price=closed.get("exit_price", 0.0),
+                                pnl=net, pnl_pct=0.0,
+                                outcome="WIN" if net > 0 else "LOSS" if net < 0 else "BREAKEVEN",
+                                hold_hours=round(hold, 2), exit_reason="MCP_SYNC")
+        if counts_today:
+            gov.record_trade_closed(net)
+        booked.append({"ticket": row["ticket"], "symbol": row["symbol"], "net_pnl": net,
+                       "counted_in_today": counts_today})
+        log.info(f"Booked closed trade {row['ticket']} {row['symbol']}: {net:+.2f}"
+                 f"{'' if counts_today else ' (not today — journal only)'}")
+    return booked
 
 
 def _get(name, factory):
@@ -196,8 +254,10 @@ def get_account_status() -> dict:
         balance = mt5b.get_account_balance()
         positions = mt5b.get_all_open_positions(_magic())
     gov = _governor(equity)
+    booked = _book_closed_trades(gov)
     return _jsonable({
         "equity": equity, "balance": balance,
+        "newly_booked_closed_trades": booked,
         "open_positions": positions,
         "governor": gov.status,
         "limits": {"daily_loss_cap_pct": config.DAILY_LOSS_CAP_PCT,
@@ -291,6 +351,7 @@ def _plan(symbol: str, direction: str, size_multiplier: float) -> dict:
     blockers = []
 
     gov = _governor(equity)
+    _book_closed_trades(gov)          # realised losses count before approving anything
     blackout, why = _calendar().is_blackout()
     ok, reason = gov.approve(current_equity=equity, open_position_count=len(positions),
                              sessions=ctx.get("sessions", []), is_blackout=blackout)
@@ -420,7 +481,9 @@ def close_position(ticket: int) -> dict:
             return _jsonable({"closed": False, "dry_run": True, "position": pos,
                               "note": "Dry run: config.MCP_TRADING_MODE is not 'live'."})
         ok = mt5b.close_position(ticket, pos["symbol"], pos["volume"], pos["type"], magic=_magic())
-    return _jsonable({"closed": bool(ok), "position": pos})
+        equity = mt5b.get_account_equity()
+    booked = _book_closed_trades(_governor(equity)) if ok else []
+    return _jsonable({"closed": bool(ok), "position": pos, "booked": booked})
 
 
 # ── HTTP auth (ChatGPT supports OAuth or no auth — not API-key headers) ─────

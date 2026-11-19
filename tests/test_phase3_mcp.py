@@ -90,6 +90,11 @@ class MCPInProcess(unittest.TestCase):
             sys.modules.pop(m, None)
         os.chdir(self.old_cwd)
 
+    def state_file(self):
+        """Governor state file for the fake MT5 account (login 1)."""
+        root, ext = os.path.splitext(self.config.GOVERNOR_STATE_PATH)
+        return f"{root}_1{ext}"
+
     def call(self, name, **args):
         from mcp.client import Client
 
@@ -150,7 +155,7 @@ class MCPInProcess(unittest.TestCase):
         r = self.call("place_trade", symbol="EURUSD", direction="BUY", reason="test")
         self.assertTrue(r["placed"], r)
         self.assertEqual(len(self.fake.orders_sent), 1)
-        with open(self.config.GOVERNOR_STATE_PATH) as f:
+        with open(self.state_file()) as f:
             self.assertEqual(json.load(f)["orders_today"], 1)
         dup = self.call("place_trade", symbol="EURUSD", direction="BUY")
         self.assertFalse(dup["placed"])
@@ -166,8 +171,8 @@ class MCPInProcess(unittest.TestCase):
         self.config.MCP_TRADING_MODE = "live"
         from datetime import datetime, timezone
         os.makedirs("observability", exist_ok=True)
-        with open(self.config.GOVERNOR_STATE_PATH, "w") as f:
-            json.dump({"version": 1, "today": datetime.now(timezone.utc).date().isoformat(),
+        with open(self.state_file(), "w") as f:
+            json.dump({"version": 1, "account": "1", "today": datetime.now(timezone.utc).date().isoformat(),
                        "daily_pnl": "-300", "kill_active": True, "orders_today": 2,
                        "day_anchor": "10000", "drawdown_halt": False, "peak_equity": "10000"}, f)
         r = self.call("place_trade", symbol="EURUSD", direction="BUY")
@@ -193,6 +198,29 @@ class MCPInProcess(unittest.TestCase):
         r = self.call("preview_trade", symbol="EURUSD", direction="HOLD")
         self.assertNotIn("allowed", r)       # tool error, no plan
 
+
+    def test_closing_a_loser_counts_toward_daily_loss_cap(self):
+        """Codex review on #3: MCP closes must reach the governor's daily P&L."""
+        self.config.MCP_TRADING_MODE = "live"
+        t = self.call("place_trade", symbol="EURUSD", direction="BUY")["ticket"]
+        self.fake.next_close_profit[0] = -300.0          # 3% loss > 2% daily cap
+        closed = self.call("close_position", ticket=t)
+        self.assertTrue(closed["closed"])
+        self.assertEqual(closed["booked"][0]["net_pnl"], -300.0)
+        nxt = self.call("place_trade", symbol="USDJPY", direction="BUY")
+        self.assertFalse(nxt["placed"], "daily loss cap ignored the MCP close")
+        self.assertTrue(any("Kill switch" in b for b in nxt["blockers"]), nxt["blockers"])
+
+    def test_stop_loss_hit_is_booked_once(self):
+        self.config.MCP_TRADING_MODE = "live"
+        t = self.call("place_trade", symbol="EURUSD", direction="BUY")["ticket"]
+        self.fake.stop_out(t, -120.0)                    # broker closes it at SL
+        a = self.call("get_account_status")
+        self.assertEqual([b["net_pnl"] for b in a["newly_booked_closed_trades"]], [-120.0])
+        self.assertEqual(a["governor"]["daily_pnl"], -120.0)
+        again = self.call("get_account_status")          # not booked twice
+        self.assertEqual(again["newly_booked_closed_trades"], [])
+        self.assertEqual(again["governor"]["daily_pnl"], -120.0)
 
     def test_simultaneous_orders_cannot_exceed_max_positions(self):
         self.config.MCP_TRADING_MODE = "live"
@@ -226,7 +254,7 @@ class MCPStdio(unittest.TestCase):
                 mkt = _result(await c.call_tool("analyze_market", {"symbol": "EURUSD"}))
                 return names, acct, mkt
         names, acct, mkt = anyio.run(go)
-        self.assertTrue(os.path.exists(os.path.join(tmp, "observability", "governor_state.json")),
+        self.assertTrue(os.path.exists(os.path.join(tmp, "observability", "governor_state_1.json")),
                         "server did not work from FOREX_BOT_DIR")
         self.assertIn("place_trade", names)
         self.assertEqual(acct["equity"], 10_000.0)
