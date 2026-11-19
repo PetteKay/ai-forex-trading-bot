@@ -434,3 +434,38 @@ class TestAdoptedPositionOpenTime(unittest.TestCase):
         src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 "bot.py")).read()
         self.assertIn('entry_time    = _opened or datetime.now(UTC)', src)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reuters feed: feeds.reuters.com is gone; Google News site:reuters.com feed
+# ─────────────────────────────────────────────────────────────────────────────
+class TestReutersFeed(unittest.TestCase):
+    # Shape of a Google News RSS search response (RSS 2.0)
+    GOOGLE_NEWS_XML = b"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/"><channel>
+<title>"when:24h site:reuters.com" - Google News</title>
+<item><title>Dollar slips as Fed rate-cut bets grow - Reuters</title>
+<link>https://news.google.com/rss/articles/abc</link><pubDate>Thu, 19 Nov 2026 12:00:00 GMT</pubDate>
+<source url="https://www.reuters.com">Reuters</source></item>
+<item><title>Gold steadies near record as yields ease - Reuters</title>
+<link>https://news.google.com/rss/articles/def</link><pubDate>Thu, 19 Nov 2026 11:40:00 GMT</pubDate>
+<source url="https://www.reuters.com">Reuters</source></item>
+</channel></rss>"""
+
+    def test_dead_reuters_address_removed(self):
+        from data import news_feed
+        self.assertFalse(any("feeds.reuters.com" in u for u in news_feed._RSS_FEEDS))
+        self.assertTrue(any("site:reuters.com" in u for u in news_feed._RSS_FEEDS))
+
+    def test_google_news_reuters_headlines_parse_and_rank(self):
+        import io
+        from unittest import mock
+        from data import news_feed
+        with mock.patch.object(news_feed, "urlopen",
+                               return_value=io.BytesIO(self.GOOGLE_NEWS_XML)):
+            titles = news_feed._parse_rss("https://news.google.com/rss/search?q=x")
+        self.assertEqual(len(titles), 2)
+        self.assertTrue(titles[0].startswith("Dollar slips"))
+        # USDJPY keywords include "dollar" and "fed" → the dollar story ranks first
+        ranked = news_feed._rank_for_symbol(titles, "USDJPY", 1)
+        self.assertTrue(ranked[0].startswith("Dollar slips"))

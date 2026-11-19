@@ -33,9 +33,17 @@ _SYMBOL_KEYWORDS: dict[str, list[str]] = {
 }
 
 # Free RSS feeds — no auth, no rate limits
+#
+# Reuters: feeds.reuters.com stopped updating in June 2020 and no longer
+# connects, and reuters.com has no public RSS feed (its arc/outboundfeeds
+# addresses return errors). reuters.com is a web page, not a feed this
+# parser can read. A Google News search feed limited to site:reuters.com
+# returns the latest Reuters stories as standard RSS 2.0 (checked working
+# by several feed directories in Sep–Oct 2026).
+# To check every feed from your own machine:  py -m data.news_feed
 _RSS_FEEDS = [
     "https://www.forexlive.com/feed/news",
-    "https://feeds.reuters.com/reuters/businessNews",
+    "https://news.google.com/rss/search?q=when:24h+site:reuters.com&ceid=US:en&hl=en-US&gl=US",
     "https://www.marketwatch.com/rss/marketpulse",
 ]
 
@@ -121,3 +129,20 @@ def _rank_for_symbol(headlines: list[str], symbol: str, max_n: int) -> list[str]
     if top:
         log.debug(f"NewsFeed top headline for {clean}: {top[0][:80]}")
     return top
+
+
+def check_feeds() -> dict[str, str]:
+    """Fetch every feed once and report how many headlines each returned."""
+    report = {}
+    for url in _RSS_FEEDS:
+        try:
+            n = len(_parse_rss(url))
+            report[url] = f"OK — {n} headlines" if n else "EMPTY — reachable but no items"
+        except Exception as e:
+            report[url] = f"FAILED — {type(e).__name__}: {e}"
+    return report
+
+
+if __name__ == "__main__":
+    for _url, _result in check_feeds().items():
+        print(f"{_result:45s} {_url}")
