@@ -4,6 +4,7 @@ loop (bot_control.BotSide), without MT5 or LLM calls. Exits 2 if another bot
 holds the account, like bot.py.
 
   FAKE_BOT_IGNORE_STOP=1   never honours a stop request (to test stop_bot force=True)
+  FAKE_BOT_FAIL_START=1    exits during start-up like bot.py without an API key
 """
 import os
 import sys
@@ -19,6 +20,11 @@ if not ok:
     print(f"Not starting: {why}.", flush=True)
     sys.exit(2)
 print(f"fake bot {side.instance} pid {os.getpid()} mode {mode}", flush=True)
+if os.environ.get("FAKE_BOT_FAIL_START") == "1":
+    time.sleep(0.5)
+    print("Not starting: LLM_API_KEY is not set.", flush=True)
+    side.release()
+    sys.exit(2)
 ignore_stop = os.environ.get("FAKE_BOT_IGNORE_STOP") == "1"
 tick = 0
 try:

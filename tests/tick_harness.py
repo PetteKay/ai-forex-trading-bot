@@ -55,13 +55,14 @@ def _bars(n, freq, seed):
 def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None,
                  ticks=1, cfg_extra=None, on_tick_end=None, reflect_result=None,
                  close_pnl=1.0, workdir=None, start_positions=None, control=None,
-                 before_pm=None, closed_history=None, demo=False):
+                 before_pm=None, closed_history=None, demo=False, on_scan=None):
     """Run `ticks` loop iterations. Returns dict(tick_seconds of the first tick,
     llm_calls, orders, threads_seen, mt5_threads, error, closes, control).
 
     control: a factory called inside the work folder, returning the
     bot_control.BotSide passed to bot.run(control=...).
     before_pm(symbol): called just before each Fund Manager decision (mid-tick).
+    on_scan(symbol): called when stage 1 fetches a symbol's candles.
     closed_history: {ticket: net_pnl} for get_closed_trade (default close_pnl)."""
     workdir = workdir or tempfile.mkdtemp()
     old_cwd = os.getcwd()
@@ -123,6 +124,11 @@ def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None,
     open_positions = list(start_positions or [])   # orders stay open until a test closes them
     closes = []
 
+    def _candles(s, tf, count=200, **k):
+        if on_scan and tf == config.TIMEFRAME:
+            on_scan(s)
+        return _bars(count, "h" if tf != "H4" else "4h", zlib.crc32(s.encode()) % 1000)
+
     def _close_position(ticket, symbol, volume, direction, magic=None, **k):
         closes.append(ticket)
         open_positions[:] = [p for p in open_positions if p["ticket"] != ticket]
@@ -160,8 +166,7 @@ def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None,
         mock.patch.object(mb, "get_account_balance", side_effect=_mt5(lambda: 10_000.0)),
         mock.patch.object(mb, "get_account_login", side_effect=_mt5(lambda: "12345"), create=True),
         mock.patch.object(mb, "get_all_open_positions", side_effect=_mt5(lambda *a: list(open_positions))),
-        mock.patch.object(mb, "get_candles", side_effect=_mt5(
-            lambda s, tf, count=200, **k: _bars(count, "h" if tf != "H4" else "4h", zlib.crc32(s.encode()) % 1000))),
+        mock.patch.object(mb, "get_candles", side_effect=_mt5(_candles)),
         mock.patch.object(mb, "get_live_price", side_effect=_mt5(lambda s: None)),
         mock.patch.object(mb, "get_spread_pips", side_effect=_mt5(lambda s: 1.0)),
         mock.patch.object(mb, "get_risk_usd", side_effect=_mt5(lambda *a, **k: 10.0)),

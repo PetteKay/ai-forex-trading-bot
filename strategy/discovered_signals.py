@@ -36,7 +36,13 @@ import pandas as pd
 
 log = logging.getLogger("DiscoveredSignals")
 
-DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent.parent / "signal-discovery" / "src" / "signal_discovery_workflow" / "output"
+# Signals your discovery runs wrote: under the bot's folder (repo, or ForexBot.exe's)
+try:
+    import app_paths as _ap
+    _ROOT = Path(_ap.root_dir())
+except ImportError:
+    _ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_OUTPUT_DIR = _ROOT / "signal-discovery" / "src" / "signal_discovery_workflow" / "output"
 
 _SIGNALS_TTL_S = 3600   # re-scan the output dir at most hourly
 _PANEL_TTL_S   = 600    # rebuild the MT5 panel at most every 10 minutes

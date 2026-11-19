@@ -273,8 +273,11 @@ def run(args):
     log.info("=" * 65)
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
+def main(argv=None) -> int:
+    """`python csv_historical_trainer.py ...` or `ForexBot.exe train-ticks ...`."""
+    import app_paths
+    app_paths.setup()
+    parser = argparse.ArgumentParser(prog="csv_historical_trainer.py",
         description="Seed bot memory from MT5 tick-export CSVs (no MT5 connection needed)"
     )
     parser.add_argument(
@@ -289,4 +292,9 @@ if __name__ == "__main__":
         "--max-samples", type=int, default=150, dest="max_samples",
         help="Max training samples per symbol (default: 150)",
     )
-    run(parser.parse_args())
+    run(parser.parse_args(argv))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

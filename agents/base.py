@@ -20,6 +20,7 @@ Model routing: can override model per agent type via MODEL_OVERRIDES in config.
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 
@@ -35,33 +36,41 @@ _MAX_RETRIES = 2     # 3 was too many: 3 × 30s timeout = 90s per agent, killing
 _RETRY_DELAY = 2.0   # seconds
 
 
+
+class ConfigError(RuntimeError):
+    """A setting the user must fix (e.g. no API key): retrying won't help."""
+
 def init(cfg):
     global _openai_client, _anthropic_client, _active_provider, _active_cfg
 
     provider = cfg.LLM_PROVIDER.lower()
     _active_provider = provider
     _active_cfg      = cfg
+    _key = str(getattr(cfg, "LLM_API_KEY", "") or "")
+    if _key.lower().startswith("your-") or _key.lower().endswith("-here"):
+        _key = ""                               # the placeholder from .env.example / SETUP.md
+    if not _key and not (
+            provider == "claude" and os.environ.get("ANTHROPIC_API_KEY")):
+        raise ConfigError(
+            "LLM_API_KEY is not set. Put it in a file named .env in the bot's folder "
+            "(next to config.py / ForexBot.exe):\n"
+            "  LLM_API_KEY=your-key-here\n"
+            "or set it once in PowerShell:  setx LLM_API_KEY \"your-key-here\"  "
+            "(then open a new window).\n"
+            "For Ollama (local, free) any value works, e.g. LLM_API_KEY=ollama."
+        )
 
     if provider == "claude":
         try:
             import anthropic
-            _anthropic_client = anthropic.Anthropic(api_key=cfg.LLM_API_KEY)
+            _anthropic_client = anthropic.Anthropic(api_key=cfg.LLM_API_KEY or None)  # None: ANTHROPIC_API_KEY
             log.info(f"LLM ready: Claude (Anthropic) | model={cfg.LLM_MODEL}")
         except ImportError:
             raise ImportError("Run: pip install anthropic")
     else:
         try:
             from openai import OpenAI
-            api_key = cfg.LLM_API_KEY
-            if not api_key:
-                raise RuntimeError(
-                    "LLM_API_KEY is not set.\n"
-                    "Run this in PowerShell before starting the bot:\n"
-                    '  $env:LLM_API_KEY = "nvapi-YOUR-KEY-HERE"\n'
-                    "Get a key at: https://build.nvidia.com (NVIDIA NIM)\n"
-                    "The old key was leaked and must be revoked first."
-                )
-            kwargs = {"api_key": api_key}
+            kwargs = {"api_key": cfg.LLM_API_KEY}
             if getattr(cfg, "LLM_BASE_URL", None):
                 kwargs["base_url"] = cfg.LLM_BASE_URL
             _openai_client = OpenAI(**kwargs)

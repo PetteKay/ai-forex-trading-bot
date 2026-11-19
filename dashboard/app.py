@@ -7,16 +7,22 @@ Open: http://127.0.0.1:5000
 Reads from observability/trade_journal.db (WAL mode — safe while bot runs).
 """
 
-import sqlite3
-from contextlib import contextmanager
-from sqlite_conn import connect as _sqlite_connect
+import argparse
 import os
+import sqlite3
+import sys
+from contextlib import contextmanager
 
-from flask import Flask, jsonify, render_template
+# `py dashboard/app.py` puts only dashboard/ on the path: add the bot's folder
+sys.path.insert(1, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Resolve paths relative to the trading-bot root (one level above this file)
-_ROOT    = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_DB_PATH = os.path.join(_ROOT, "observability", "trade_journal.db")
+from flask import Flask, jsonify, render_template          # noqa: E402
+
+import app_paths                                           # noqa: E402
+from sqlite_conn import connect as _sqlite_connect         # noqa: E402
+
+# The bot's data folder: the repo, or the folder of ForexBot.exe
+_DB_PATH = os.path.join(app_paths.root_dir(), "observability", "trade_journal.db")
 
 app = Flask(__name__, template_folder="templates")
 
@@ -117,8 +123,18 @@ def api_open():
     return jsonify(rows)
 
 
-if __name__ == "__main__":
+def main(argv=None) -> int:
+    """`py dashboard/app.py` or `ForexBot.exe dashboard [--port 5000]`."""
+    app_paths.setup()
+    ap = argparse.ArgumentParser(prog="dashboard")
+    ap.add_argument("--port", type=int, default=5000)
+    args = ap.parse_args(argv)
     print(f"Dashboard starting — DB: {_DB_PATH}")
     print(f"DB exists: {os.path.exists(_DB_PATH)}")
-    print("Open http://127.0.0.1:5000 in your browser")
-    app.run(debug=False, host="127.0.0.1", port=5000)
+    print(f"Open http://127.0.0.1:{args.port} in your browser")
+    app.run(debug=False, host="127.0.0.1", port=args.port)     # this PC only
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
