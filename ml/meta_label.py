@@ -24,6 +24,12 @@ Extended feature set (primary 16 + 8 meta-only features = 24 total):
   [21]    fib_proximity_score        — 0-1 (1 = at a major Fibonacci level)
   [22]    cot_z_score_norm           — COT net position z-score, clipped [-2,2] → [-1,1]
   [23]    econ_surprise_norm         — Economic surprise, clipped [-30,30] → [-1,1]
+  [last]  side                       — +1 BUY / -1 SELL / 0 unknown. Meta-labeling
+                                       judges the primary model's chosen side, so the
+                                       secondary model must know which side it is.
+
+TIME FEATURES use the trade's ENTRY time at both training and inference (they
+previously used the lesson-save time at training = the trade's CLOSE time).
 
 REGIME-CONDITIONAL MODELS:
   When >= MIN_SAMPLES_PER_REGIME trades per regime are available, trains dedicated
@@ -57,6 +63,29 @@ def _encode_regime(regime_str: str) -> float:
     return _REGIME_ENCODING.get(regime_str, 0.0)
 
 
+def _encode_side(direction) -> float:
+    d = str(direction or "").upper()
+    return 1.0 if d == "BUY" else -1.0 if d == "SELL" else 0.0
+
+
+def _parse_ts(ts) -> datetime | None:
+    if isinstance(ts, datetime):
+        dt = ts
+    else:
+        try:
+            dt = datetime.fromisoformat(str(ts))
+        except Exception:
+            return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _time_features(dt: datetime) -> list[float]:
+    hour = dt.hour + dt.minute / 60.0
+    dow  = dt.weekday()
+    return [math.sin(hour * 2 * math.pi / 24), math.cos(hour * 2 * math.pi / 24),
+            math.sin(dow * 2 * math.pi / 7),   math.cos(dow * 2 * math.pi / 7)]
+
+
 _CURRENT_FV_LEN = 21  # strategy.indicators.feature_vector() length after Tier 3 upgrade
 
 
@@ -67,24 +96,20 @@ def _build_extended_features(
     fib_proximity: float = 0.0,
     cot_z_score:   float = 0.0,
     econ_surprise: float = 0.0,
+    side:          float = 0.0,
+    when:          datetime | None = None,
 ) -> list[float]:
     """
     Extend the primary technical feature vector with meta-only features.
-    Now 24 features total (was 21).
+    when: the trade's entry time (defaults to now, i.e. the moment of entry).
     """
     base = list(fv) if fv else [0.5] * _CURRENT_FV_LEN
     # Pad if the incoming vector is shorter than current standard (e.g. from old memories)
     if len(base) < _CURRENT_FV_LEN:
         base = base + [0.0] * (_CURRENT_FV_LEN - len(base))
 
-    now      = datetime.now(timezone.utc)
-    hour     = now.hour + now.minute / 60.0
-    dow      = now.weekday()
-
-    sin_hour = math.sin(hour * 2 * math.pi / 24)
-    cos_hour = math.cos(hour * 2 * math.pi / 24)
-    sin_dow  = math.sin(dow  * 2 * math.pi / 7)
-    cos_dow  = math.cos(dow  * 2 * math.pi / 7)
+    sin_hour, cos_hour, sin_dow, cos_dow = _time_features(
+        _parse_ts(when) if when is not None else datetime.now(timezone.utc))
 
     if regime_override is not None:
         regime_feat = regime_override
@@ -101,7 +126,8 @@ def _build_extended_features(
     econ_norm = max(-1.0, min(1.0, econ_surprise / 30.0))
     fib_feat  = max(0.0,  min(1.0, fib_proximity))
 
-    return base + [sin_hour, cos_hour, sin_dow, cos_dow, regime_feat, fib_feat, cot_norm, econ_norm]
+    return base + [sin_hour, cos_hour, sin_dow, cos_dow, regime_feat, fib_feat, cot_norm, econ_norm,
+                   float(side)]
 
 
 def _build_training_row(m: dict) -> tuple[list[float], float]:
@@ -115,18 +141,10 @@ def _build_training_row(m: dict) -> tuple[list[float], float]:
     # Pad old memories that have fewer features than the current vector length
     if len(fv) < _CURRENT_FV_LEN:
         fv = fv + [0.0] * (_CURRENT_FV_LEN - len(fv))
-    ts = m.get("timestamp", "")
-    try:
-        dt   = datetime.fromisoformat(ts)
-        hour = dt.hour + dt.minute / 60.0
-        dow  = dt.weekday()
-    except Exception:
-        hour, dow = 12.0, 2
-
-    sin_hour = math.sin(hour * 2 * math.pi / 24)
-    cos_hour = math.cos(hour * 2 * math.pi / 24)
-    sin_dow  = math.sin(dow  * 2 * math.pi / 7)
-    cos_dow  = math.cos(dow  * 2 * math.pi / 7)
+    dt = _parse_ts(m.get("entry_time") or m.get("timestamp", ""))
+    if dt is None:
+        dt = datetime(2000, 1, 5, 12, tzinfo=timezone.utc)   # neutral: Wed 12:00
+    sin_hour, cos_hour, sin_dow, cos_dow = _time_features(dt)
 
     regime_str  = m.get("regime", "")
     regime_feat = _encode_regime(str(regime_str))
@@ -136,10 +154,53 @@ def _build_training_row(m: dict) -> tuple[list[float], float]:
     cot_norm  = max(-1.0, min(1.0, float(m.get("cot_z_score",   0.0)) / 2.0))
     econ_norm = max(-1.0, min(1.0, float(m.get("econ_surprise", 0.0)) / 30.0))
 
-    return fv + [sin_hour, cos_hour, sin_dow, cos_dow, regime_feat, fib_prox, cot_norm, econ_norm], regime_feat
+    return (fv + [sin_hour, cos_hour, sin_dow, cos_dow, regime_feat, fib_prox, cot_norm, econ_norm,
+                  _encode_side(m.get("direction"))], regime_feat)
 
 
-_HOLDING_PERIOD_BARS = 24   # H1 bars — one trading day. Used as embargo in purged CV.
+_HOLDING_PERIOD_BARS = 24   # hours — concurrency window for uniqueness weighting.
+
+# Assumed label length (entry → exit) when a sample has no recorded exit time.
+# Matches the bot's MAX_HOLD_HOURS default (48h time exit), so purging is conservative.
+_DEFAULT_LABEL_HOURS = 48
+_MIN_TRAIN_PER_FOLD  = 10
+
+
+def _purged_time_splits(starts: list, ends: list, y: np.ndarray,
+                        n_splits: int) -> list[tuple[np.ndarray, np.ndarray]]:
+    """
+    Walk-forward CV splits purged by TIME, not by row count (AFML ch. 7).
+
+    Samples are sorted by entry time. Each fold tests one contiguous block and
+    trains only on earlier samples whose label had finished (exit time) before
+    the test block's first entry — so no training label overlaps a test label.
+
+    The old TimeSeriesSplit(gap=24) skipped 24 *trades* instead of 24 hours and
+    raised "Too many splits" for every sample count from 30 to ~147, so the ML
+    gate silently fell back to the heuristic (verified).
+
+    Folds whose train or test side lacks one of the two classes, or whose train
+    side is smaller than _MIN_TRAIN_PER_FOLD, are dropped.
+    """
+    n = len(starts)
+    if n_splits < 2 or n < 2 * n_splits:
+        return []
+    test_size = n // (n_splits + 1)
+    splits = []
+    for k in range(n_splits):
+        test_lo = n - (n_splits - k) * test_size
+        test_hi = test_lo + test_size if k < n_splits - 1 else n
+        test_idx = np.arange(test_lo, test_hi)
+        t0 = starts[test_lo]
+        train_idx = np.array([i for i in range(test_lo)
+                              if ends[i] is not None and t0 is not None and ends[i] < t0],
+                             dtype=int)
+        if len(train_idx) < _MIN_TRAIN_PER_FOLD:
+            continue
+        if len(set(y[train_idx])) < 2 or len(set(y[test_idx])) < 2:
+            continue
+        splits.append((train_idx, test_idx))
+    return splits
 
 
 def _compute_sample_weights(timestamps: list[str],
@@ -207,15 +268,15 @@ def _compute_sample_weights(timestamps: list[str],
 
 def _fit_classifier(X: np.ndarray, y: np.ndarray,
                     clf_name_hint: str = "",
-                    sample_weight: np.ndarray | None = None) -> object | None:
+                    sample_weight: np.ndarray | None = None,
+                    starts: list | None = None,
+                    ends: list | None = None) -> object | None:
     """
     Fit a calibrated LightGBM (or RandomForest fallback) classifier.
 
-    Uses TimeSeriesSplit with gap=HOLDING_PERIOD_BARS as the CV strategy.
-    This is a practical approximation of purged k-fold:
-    - Data must be sorted by timestamp BEFORE calling this function (ensured in train())
-    - gap=24 creates an embargo of 24 bars between train and test sets
-    - Eliminates the most dangerous look-ahead from overlapping H1 barriers
+    Uses time-purged walk-forward splits (_purged_time_splits): data must be
+    sorted by entry time (ensured in train()); a training sample is used only if
+    its label ended before the test block starts, so labels never overlap.
 
     Calibration method: 'sigmoid' (Platt scaling) is the default and correct choice
     at N < 300. Isotonic overfits badly at small N (research: arXiv:2002.10199).
@@ -224,7 +285,6 @@ def _fit_classifier(X: np.ndarray, y: np.ndarray,
     """
     try:
         from sklearn.calibration import CalibratedClassifierCV
-        from sklearn.model_selection import TimeSeriesSplit
         import warnings
         warnings.filterwarnings("ignore")
 
@@ -252,13 +312,30 @@ def _fit_classifier(X: np.ndarray, y: np.ndarray,
             )
             clf_name = f"RandomForest{clf_name_hint}"
 
-        # TimeSeriesSplit with embargo gap instead of random k-fold
-        # gap=HOLDING_PERIOD_BARS means train[:-24] and test[24:] → no overlap leakage
-        n_splits = min(5, max(2, len(X) // 10))
-        tscv     = TimeSeriesSplit(n_splits=n_splits, gap=_HOLDING_PERIOD_BARS)
+        # Time-purged walk-forward splits (see _purged_time_splits).
+        if len(set(y)) < 2:
+            log.info(f"Meta-label{clf_name_hint}: only one outcome class in data — skipped.")
+            return None
+        if starts is None or ends is None:
+            # No timing info: treat rows as 1h apart with the default label length.
+            base   = datetime(2000, 1, 1, tzinfo=timezone.utc)
+            starts = [base + timedelta(hours=i) for i in range(len(X))]
+            ends   = [t + timedelta(hours=_DEFAULT_LABEL_HOURS) for t in starts]
+        splits = []
+        for n_try in (min(5, max(2, len(X) // 10)), 3, 2):
+            splits = _purged_time_splits(starts, ends, y, n_try)
+            if len(splits) >= 2:
+                break
+        if len(splits) < 2:
+            log.info(
+                f"Meta-label{clf_name_hint}: {len(X)} samples do not give 2 valid "
+                f"purged CV folds yet — keeping heuristic."
+            )
+            return None
+        n_splits = len(splits)
 
         # CalibratedClassifierCV with Platt (sigmoid) — correct for small N
-        calibrated = CalibratedClassifierCV(clf, cv=tscv, method="sigmoid")
+        calibrated = CalibratedClassifierCV(clf, cv=splits, method="sigmoid")
         fit_kwargs = {}
         if sample_weight is not None and len(sample_weight) == len(X):
             fit_kwargs["sample_weight"] = sample_weight
@@ -268,7 +345,7 @@ def _fit_classifier(X: np.ndarray, y: np.ndarray,
         log.info(
             f"Meta-label [{clf_name}] trained on {len(X)} samples | "
             f"base win rate: {win_rate:.1%} | "
-            f"CV: TimeSeriesSplit(n={n_splits}, gap={_HOLDING_PERIOD_BARS})"
+            f"CV: time-purged walk-forward, {n_splits} folds"
         )
         return calibrated
     except Exception as e:
@@ -331,8 +408,10 @@ class MetaLabelGate:
             return False
 
         try:
-            # ── Sort by timestamp (required for TimeSeriesSplit in _fit_classifier) ──
-            samples.sort(key=lambda m: m.get("timestamp", ""))
+            # ── Sort by ENTRY time (required by the purged splits) ──
+            _far_past = datetime(1970, 1, 1, tzinfo=timezone.utc)
+            samples.sort(key=lambda m: _parse_ts(m.get("entry_time") or m.get("timestamp", ""))
+                         or _far_past)
 
             # ── Build combined feature matrix ─────────────────────────────
             X_rows, regimes, outcomes, timestamps, pnl_vals, syms = [], [], [], [], [], []
@@ -341,7 +420,7 @@ class MetaLabelGate:
                 X_rows.append(row)
                 regimes.append(regime_feat)
                 outcomes.append(1 if (m.get("r_multiple", m.get("pnl_pct", 0)) > 0) else 0)
-                timestamps.append(m.get("timestamp", ""))
+                timestamps.append(m.get("entry_time") or m.get("timestamp", ""))
                 pnl_vals.append(abs(float(m.get("pnl_pct", 0.1)) or 0.1))
                 syms.append(m.get("symbol", ""))
 
@@ -349,13 +428,23 @@ class MetaLabelGate:
             y = np.array(outcomes)
             r = np.array(regimes)
 
+            # Label windows for purging: entry → exit (exit unknown → +48h).
+            starts = [_parse_ts(t) for t in timestamps]
+            ends   = []
+            for m, t0 in zip(samples, starts):
+                t1 = _parse_ts(m.get("exit_time")) if m.get("exit_time") else None
+                if t1 is None and t0 is not None:
+                    t1 = t0 + timedelta(hours=_DEFAULT_LABEL_HOURS)
+                ends.append(t1)
+
             # ── Uniqueness weighting (AFML Ch.4) — correct for time-overlap leakage ──
             # Per-symbol concurrency: only same-instrument overlapping labels dilute
             # each other. Cross-symbol trades at the same hour are separate paths.
             sample_weights = _compute_sample_weights(timestamps, pnl_vals, symbols=syms)
 
             # ── Combined model ────────────────────────────────────────────
-            model = _fit_classifier(X, y, sample_weight=sample_weights)
+            model = _fit_classifier(X, y, sample_weight=sample_weights,
+                                    starts=starts, ends=ends)
             if model is None:
                 self._trained = False
                 return False
@@ -372,6 +461,8 @@ class MetaLabelGate:
                 m_trend = _fit_classifier(
                     X[trending_mask], y[trending_mask], "[TRENDING]",
                     sample_weight=sample_weights[trending_mask],
+                    starts=[t for t, k in zip(starts, trending_mask) if k],
+                    ends=[t for t, k in zip(ends, trending_mask) if k],
                 )
                 self._model_trending = m_trend
             else:
@@ -385,6 +476,8 @@ class MetaLabelGate:
                 m_range = _fit_classifier(
                     X[ranging_mask], y[ranging_mask], "[RANGING]",
                     sample_weight=sample_weights[ranging_mask],
+                    starts=[t for t, k in zip(starts, ranging_mask) if k],
+                    ends=[t for t, k in zip(ends, ranging_mask) if k],
                 )
                 self._model_ranging = m_range
             else:
@@ -409,9 +502,12 @@ class MetaLabelGate:
         fib_proximity: float = 0.0,
         cot_z_score:   float = 0.0,
         econ_surprise: float = 0.0,
+        direction:     str   = "",
     ) -> dict:
         """
         Predict probability of a profitable trade.
+        direction: the side the agent desk chose ("BUY"/"SELL"). The model was
+        trained with the side as a feature, so pass it for a meaningful answer.
 
         Uses regime-conditional model when available, falling back to combined, then heuristic.
 
@@ -437,6 +533,7 @@ class MetaLabelGate:
             fib_proximity=fib_proximity,
             cot_z_score=cot_z_score,
             econ_surprise=econ_surprise,
+            side=_encode_side(direction),
         )
 
         if self._trained:
@@ -515,6 +612,8 @@ class MetaLabelGate:
         fib_proximity:  float = 0.0,
         cot_z_score:    float = 0.0,
         econ_surprise:  float = 0.0,
+        direction:      str   = "",
+        entry_time      = None,
     ) -> None:
         """
         Update the SGD companion model with a single completed trade result.
@@ -531,6 +630,8 @@ class MetaLabelGate:
             fib_proximity=fib_proximity,
             cot_z_score=cot_z_score,
             econ_surprise=econ_surprise,
+            side=_encode_side(direction),
+            when=entry_time,      # entry time, not the close time this runs at
         )
         X = np.array(extended, dtype=float)
 

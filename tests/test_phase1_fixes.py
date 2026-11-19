@@ -196,3 +196,136 @@ class TestClosedCandlesOnly(unittest.TestCase):
         b = self._bridge_with(calls)
         b.get_candles("EURUSD", "H1", count=5, include_forming=True)
         self.assertEqual(calls, [0])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bugs 4-7: meta-label gate
+# ─────────────────────────────────────────────────────────────────────────────
+def _fake_trades(n, seed=0, start=None, direction_fn=None, hours_apart=6):
+    from datetime import datetime, timedelta, timezone
+    rng = np.random.default_rng(seed)
+    start = start or datetime.now(timezone.utc) - timedelta(hours=hours_apart * n + 1)
+    out = []
+    for i in range(n):
+        t0 = start + timedelta(hours=hours_apart * i)
+        d  = direction_fn(i) if direction_fn else ("BUY" if i % 2 else "SELL")
+        r  = float(rng.normal())
+        out.append({
+            "feature_vector": list(rng.random(21)), "symbol": "EURUSD", "direction": d,
+            "entry_time": t0.isoformat(), "exit_time": (t0 + timedelta(hours=5)).isoformat(),
+            "timestamp": t0.isoformat(), "outcome": "WIN" if r > 0 else "LOSS",
+            "r_multiple": r, "pnl_pct": r, "regime": "TRENDING_UP",
+        })
+    return out
+
+
+class TestMetaLabelTrainsOnSmallSamples(unittest.TestCase):
+    """Bug 4: TimeSeriesSplit(gap=24 rows) failed for every N from 30 to ~147."""
+
+    def test_trains_across_small_sample_sizes(self):
+        from ml.meta_label import MetaLabelGate
+        failed = []
+        for n in (30, 45, 60, 80, 100, 120, 144):
+            g = MetaLabelGate()
+            g.train(_fake_trades(n, seed=n), training_lookback_days=0)
+            if not g._trained:
+                failed.append(n)
+        self.assertEqual(failed, [], f"ML gate failed to train at N={failed}")
+
+    def test_purged_splits_never_overlap_labels(self):
+        from datetime import datetime, timedelta, timezone
+        from ml.meta_label import _purged_time_splits
+        t = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        starts = [t + timedelta(hours=3 * i) for i in range(80)]
+        ends   = [s + timedelta(hours=30) for s in starts]          # long-held trades
+        y = np.array([i % 2 for i in range(80)])
+        splits = _purged_time_splits(starts, ends, y, 4)
+        self.assertGreaterEqual(len(splits), 2)
+        for tr, te in splits:
+            first_test = starts[te[0]]
+            self.assertTrue(all(ends[i] < first_test for i in tr),
+                            "A training label is still open when the test block starts")
+
+
+class TestMetaLabelKnowsTheSide(unittest.TestCase):
+    """Bug 5: the gate could not tell a BUY from a SELL in the same market state."""
+
+    def test_same_market_different_side_gives_different_probability(self):
+        from ml.meta_label import MetaLabelGate
+        rng = np.random.default_rng(7)
+        trades = _fake_trades(160, seed=7)
+        for tr in trades:                         # BUYs win, SELLs lose, same features
+            tr["feature_vector"] = list(rng.random(21))
+            tr["r_multiple"] = 1.0 if tr["direction"] == "BUY" else -1.0
+            tr["outcome"] = "WIN" if tr["direction"] == "BUY" else "LOSS"
+        g = MetaLabelGate()
+        self.assertTrue(g.train(trades, training_lookback_days=0))
+        fv = list(rng.random(21))
+        ctx = {"regime": {"regime": "TRENDING_UP"}}
+        p_buy  = g.predict(fv, ctx, direction="BUY")["probability"]
+        p_sell = g.predict(fv, ctx, direction="SELL")["probability"]
+        self.assertGreater(p_buy - p_sell, 0.2,
+                           f"Side ignored: BUY={p_buy:.3f} SELL={p_sell:.3f}")
+
+    def test_training_row_contains_side(self):
+        from ml.meta_label import _build_training_row
+        base = _fake_trades(1)[0]
+        buy  = _build_training_row({**base, "direction": "BUY"})[0]
+        sell = _build_training_row({**base, "direction": "SELL"})[0]
+        self.assertNotEqual(buy, sell)
+        self.assertEqual((buy[-1], sell[-1]), (1.0, -1.0))
+
+
+class TestMetaLabelUsesEntryTime(unittest.TestCase):
+    """Bug 6: training took hour/weekday from the lesson save time (trade close)."""
+
+    def test_training_time_features_follow_entry_time(self):
+        from ml.meta_label import _build_training_row, _build_extended_features
+        m = {**_fake_trades(1)[0],
+             "entry_time": "2026-03-02T08:00:00+00:00",     # Monday 08:00 (entry)
+             "timestamp":  "2026-03-03T20:00:00+00:00"}     # Tuesday 20:00 (saved)
+        row = _build_training_row(m)[0]
+        live = _build_extended_features(m["feature_vector"], {}, regime_override=row[-5],
+                                        side=1.0 if m["direction"] == "BUY" else -1.0,
+                                        when="2026-03-02T08:00:00+00:00")
+        np.testing.assert_allclose(row[21:25], live[21:25], atol=1e-9)
+
+
+class TestEveryClosedTradeIsTrainingData(unittest.TestCase):
+    """Bug 7: only lessons the reflection LLM kept (and pruning spared) were trained on."""
+
+    def test_unsaved_lessons_still_train(self):
+        from memory.store import TradeMemoryStore
+        d = tempfile.mkdtemp()
+        store = TradeMemoryStore(os.path.join(d, "m.db"), usefulness_threshold=0.9)
+        for i, tr in enumerate(_fake_trades(5)):
+            store.save_ml_sample({**tr, "ticket": 1000 + i})
+        rows = store.get_all_for_training()
+        self.assertEqual(len(rows), 5)
+        self.assertTrue(all(r["entry_time"] for r in rows))
+
+    def test_saved_lesson_not_counted_twice(self):
+        from memory.store import TradeMemoryStore
+        d = tempfile.mkdtemp()
+        store = TradeMemoryStore(os.path.join(d, "m.db"), usefulness_threshold=0.1)
+        tr = _fake_trades(1)[0]
+        store.save_ml_sample({**tr, "ticket": 1})
+        store.save_ml_sample({**tr, "ticket": 1})                  # idempotent
+        lesson = {**tr, "entry_price": 1.0, "exit_price": 1.1, "fingerprint": "x",
+                  "lesson": "test", "usefulness_score": 0.9, "ml_sampled": 1}
+        from unittest import mock
+        with mock.patch.dict(sys.modules, {"memory.semantic": None}):
+            self.assertTrue(store.save(lesson))
+        self.assertEqual(len(store.get_all_for_training()), 1)
+
+    def test_old_memories_still_used(self):
+        from memory.store import TradeMemoryStore
+        d = tempfile.mkdtemp()
+        store = TradeMemoryStore(os.path.join(d, "m.db"), usefulness_threshold=0.1)
+        tr = _fake_trades(1)[0]
+        lesson = {**tr, "entry_price": 1.0, "exit_price": 1.1, "fingerprint": "x",
+                  "lesson": "old", "usefulness_score": 0.9}         # pre-fix: ml_sampled 0
+        from unittest import mock
+        with mock.patch.dict(sys.modules, {"memory.semantic": None}):
+            store.save(lesson)
+        self.assertEqual(len(store.get_all_for_training()), 1)

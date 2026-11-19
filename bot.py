@@ -491,52 +491,84 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                     pm_decision        = record.pm_decision,
                     cfg                = config,
                 )
+                _rc_entry = record.entry_context.get("regime", {})
+                _regime_entry = _rc_entry.get("regime", "") if isinstance(_rc_entry, dict) else ""
+                _entry_iso = (record.entry_time.isoformat()
+                              if hasattr(record.entry_time, "isoformat") else str(record.entry_time))
+                _exit_iso  = datetime.now(UTC).isoformat()
+
                 if lesson_record:
                     lesson_record["feature_vector"] = feature_vector(record.entry_context)
                     lesson_record["r_multiple"]     = r_multiple
-                    _rc = record.entry_context.get("regime", {})
-                    lesson_record["regime"] = _rc.get("regime", "") if isinstance(_rc, dict) else ""
-                    # Store Tier 1 signal context for 24-feature ML training
+                    lesson_record["regime"]         = _regime_entry
+                    # Store Tier 1 signal context for ML training
                     lesson_record["fib_proximity"] = record.entry_context.get("fib_proximity", 0.0)
                     lesson_record["cot_z_score"]   = record.entry_context.get("cot_z_score", 0.0)
                     lesson_record["econ_surprise"]  = record.entry_context.get("econ_surprise", 0.0)
+                    lesson_record["entry_time"]     = _entry_iso
+                    # This trade's training row lives in ml_samples (below), so the
+                    # memory copy is excluded from training to avoid counting it twice.
+                    lesson_record["ml_sampled"]     = 1 if record.entry_context else 0
                     saved = memory.save(lesson_record)
                     if saved:
                         log.info(f"★ [{sym}] Lesson saved: {lesson_record['lesson'][:100]}")
-                        # SGD online update — immediate single-trade adaptation
-                        try:
-                            _fv_ol = feature_vector(record.entry_context)
-                            _rc_ol = record.entry_context.get("regime", {})
-                            _re_ol = _rc_ol.get("regime", "") if isinstance(_rc_ol, dict) else ""
-                            meta_gate.online_update(
-                                feature_vector = _fv_ol,
-                                is_win         = net_pnl > 0,
-                                regime_str     = _re_ol,
-                                fib_proximity  = record.entry_context.get("fib_proximity", 0.0),
-                                cot_z_score    = record.entry_context.get("cot_z_score", 0.0),
-                                econ_surprise  = record.entry_context.get("econ_surprise", 0.0),
-                            )
-                        except Exception as _ol_err:
-                            log.debug(f"Online update error: {_ol_err}")
-                        memories_since_retrain += 1
-                        if memories_since_retrain >= config.META_RETRAIN_EVERY:
-                            all_m = memory.get_all_for_training()
-                            meta_gate.train(all_m, training_lookback_days=getattr(config, "ML_TRAINING_LOOKBACK_DAYS", 180))
-                            memories_since_retrain = 0
 
-                            # Walk-forward: adapt confidence threshold based on recent results
-                            if (_ADAPTIVE_PARAMS_AVAILABLE
-                                    and getattr(config, "ADAPTIVE_CONFIDENCE_ENABLED", False)):
-                                _new_conf, _conf_reason = compute_adaptive_confidence(
-                                    db_path           = config.JOURNAL_DB_PATH,
-                                    lookback_trades   = getattr(config, "ADAPTIVE_CONFIDENCE_LOOKBACK", 30),
-                                    current_threshold = _dynamic_min_confidence,
-                                )
-                                if _new_conf != _dynamic_min_confidence:
-                                    log.info(f"AdaptiveConf: {_conf_reason}")
-                                    _dynamic_min_confidence = _new_conf
-                                else:
-                                    log.debug(f"AdaptiveConf: {_conf_reason}")
+                # ── ML training data: EVERY closed trade, not only saved lessons ──
+                # Training only on lessons the reflection LLM chose to keep (and that
+                # survived usefulness pruning) biased the meta-label model's data.
+                # Adopted positions (no entry context) have no features to learn from.
+                if record.entry_context:
+                    try:
+                        memory.save_ml_sample({
+                            "ticket":         ticket,
+                            "symbol":         sym,
+                            "direction":      record.direction,
+                            "entry_time":     _entry_iso,
+                            "exit_time":      _exit_iso,
+                            "feature_vector": feature_vector(record.entry_context),
+                            "regime":         _regime_entry,
+                            "fib_proximity":  record.entry_context.get("fib_proximity", 0.0),
+                            "cot_z_score":    record.entry_context.get("cot_z_score", 0.0),
+                            "econ_surprise":  record.entry_context.get("econ_surprise", 0.0),
+                            "r_multiple":     r_multiple,
+                            "pnl_pct":        pnl_pct,
+                            "outcome":        outcome,
+                        })
+                    except Exception as _ms_err:
+                        log.warning(f"[{sym}] Could not store ML sample: {_ms_err}")
+                    # SGD online update — immediate single-trade adaptation
+                    try:
+                        meta_gate.online_update(
+                            feature_vector = feature_vector(record.entry_context),
+                            is_win         = net_pnl > 0,
+                            regime_str     = _regime_entry,
+                            fib_proximity  = record.entry_context.get("fib_proximity", 0.0),
+                            cot_z_score    = record.entry_context.get("cot_z_score", 0.0),
+                            econ_surprise  = record.entry_context.get("econ_surprise", 0.0),
+                            direction      = record.direction,
+                            entry_time     = record.entry_time,
+                        )
+                    except Exception as _ol_err:
+                        log.debug(f"Online update error: {_ol_err}")
+                    memories_since_retrain += 1
+                    if memories_since_retrain >= config.META_RETRAIN_EVERY:
+                        all_m = memory.get_all_for_training()
+                        meta_gate.train(all_m, training_lookback_days=getattr(config, "ML_TRAINING_LOOKBACK_DAYS", 180))
+                        memories_since_retrain = 0
+
+                        # Walk-forward: adapt confidence threshold based on recent results
+                        if (_ADAPTIVE_PARAMS_AVAILABLE
+                                and getattr(config, "ADAPTIVE_CONFIDENCE_ENABLED", False)):
+                            _new_conf, _conf_reason = compute_adaptive_confidence(
+                                db_path           = config.JOURNAL_DB_PATH,
+                                lookback_trades   = getattr(config, "ADAPTIVE_CONFIDENCE_LOOKBACK", 30),
+                                current_threshold = _dynamic_min_confidence,
+                            )
+                            if _new_conf != _dynamic_min_confidence:
+                                log.info(f"AdaptiveConf: {_conf_reason}")
+                                _dynamic_min_confidence = _new_conf
+                            else:
+                                log.debug(f"AdaptiveConf: {_conf_reason}")
 
             # ── Kill-switch guard ─────────────────────────────────────────
             gov_status = governor.status
@@ -1249,6 +1281,7 @@ def run(demo_mode: bool = False, reset_drawdown_halt: bool = False):
                         fib_proximity = ctx.get("fib_proximity", 0.0),
                         cot_z_score   = ctx.get("cot_z_score", 0.0),
                         econ_surprise = ctx.get("econ_surprise", 0.0),
+                        direction     = action,
                     )
                     ml_prob   = ml_result["probability"]
                     ml_pass   = meta_gate.should_trade(ml_prob, config.META_LABEL_MIN_PROB)

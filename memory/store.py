@@ -72,8 +72,9 @@ class TradeMemoryStore:
                    pnl_pct, r_multiple, outcome, fingerprint, feature_vector,
                    market_context, agent_reasoning, lesson, usefulness_score,
                    pattern_name, category, times_recalled, lesson_embedding,
-                   regime, fib_proximity, cot_z_score, econ_surprise)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?,?)
+                   regime, fib_proximity, cot_z_score, econ_surprise,
+                   entry_time, ml_sampled)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,?)
             """, (
                 datetime.now(timezone.utc).isoformat(),
                 memory["symbol"],
@@ -96,6 +97,8 @@ class TradeMemoryStore:
                 float(memory.get("fib_proximity", 0.0) or 0.0),
                 float(memory.get("cot_z_score", 0.0) or 0.0),
                 float(memory.get("econ_surprise", 0.0) or 0.0),
+                memory.get("entry_time"),
+                int(memory.get("ml_sampled", 0) or 0),
             ))
 
         log.info(
@@ -308,14 +311,71 @@ class TradeMemoryStore:
         log.debug(f"Semantic recall: {len(result)} results for query='{query[:60]}'")
         return result
 
+    def save_ml_sample(self, sample: dict) -> None:
+        """
+        Store one closed trade as ML training data — every closed trade, with no
+        usefulness filter and no pruning. Idempotent per ticket.
+        """
+        with sqlite3.connect(self._db) as con:
+            con.execute("""
+                INSERT OR IGNORE INTO ml_samples
+                  (ticket, symbol, direction, entry_time, exit_time, feature_vector,
+                   regime, fib_proximity, cot_z_score, econ_surprise,
+                   r_multiple, pnl_pct, outcome)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                sample.get("ticket"),
+                sample["symbol"],
+                sample["direction"],
+                sample["entry_time"],
+                sample.get("exit_time"),
+                json.dumps(sample["feature_vector"]),
+                sample.get("regime", ""),
+                float(sample.get("fib_proximity", 0.0) or 0.0),
+                float(sample.get("cot_z_score", 0.0) or 0.0),
+                float(sample.get("econ_surprise", 0.0) or 0.0),
+                sample.get("r_multiple"),
+                sample.get("pnl_pct"),
+                sample.get("outcome"),
+            ))
+
     def get_all_for_training(self) -> list[dict]:
-        """Return all memories as dicts (for meta-label model training)."""
+        """
+        Return training rows for the meta-label model:
+          • every live closed trade from ml_samples (unfiltered), plus
+          • memories not already covered there — historical-trainer seeds and
+            lessons saved before ml_samples existed (ml_sampled = 0).
+        Live trades whose lesson was also saved (ml_sampled = 1) appear once.
+        """
         with sqlite3.connect(self._db) as con:
             con.row_factory = sqlite3.Row
             rows = con.execute(
-                "SELECT * FROM memories ORDER BY timestamp DESC"
+                "SELECT * FROM memories WHERE COALESCE(ml_sampled, 0) = 0 "
+                "ORDER BY timestamp DESC"
             ).fetchall()
-        return [
+            ml_rows = con.execute(
+                "SELECT * FROM ml_samples ORDER BY entry_time DESC"
+            ).fetchall()
+        samples = [
+            {
+                "symbol":         r["symbol"],
+                "direction":      r["direction"],
+                "outcome":        r["outcome"],
+                "pnl_pct":        r["pnl_pct"],
+                "r_multiple":     r["r_multiple"],
+                "feature_vector": json.loads(r["feature_vector"]) if r["feature_vector"] else None,
+                "timestamp":      r["entry_time"],
+                "entry_time":     r["entry_time"],
+                "exit_time":      r["exit_time"],
+                "regime":         r["regime"] or "",
+                "fib_proximity":  r["fib_proximity"] or 0.0,
+                "cot_z_score":    r["cot_z_score"] or 0.0,
+                "econ_surprise":  r["econ_surprise"] or 0.0,
+                "source":         "ml_samples",
+            }
+            for r in ml_rows
+        ]
+        return samples + [
             {
                 "symbol":           r["symbol"],       # needed for per-symbol uniqueness weighting
                 "direction":        r["direction"],
@@ -332,6 +392,8 @@ class TradeMemoryStore:
                 "fib_proximity":    r["fib_proximity"] or 0.0,
                 "cot_z_score":      r["cot_z_score"] or 0.0,
                 "econ_surprise":    r["econ_surprise"] or 0.0,
+                "entry_time":       r["entry_time"],
+                "source":           "memories",
             }
             for r in rows
         ]
@@ -387,11 +449,35 @@ class TradeMemoryStore:
                 ("ALTER TABLE memories ADD COLUMN fib_proximity REAL",   None),
                 ("ALTER TABLE memories ADD COLUMN cot_z_score REAL",     None),
                 ("ALTER TABLE memories ADD COLUMN econ_surprise REAL",   None),
+                # Trade entry time (time features must use entry, not save time)
+                ("ALTER TABLE memories ADD COLUMN entry_time TEXT",      None),
+                # 1 = this trade's training row lives in ml_samples
+                ("ALTER TABLE memories ADD COLUMN ml_sampled INTEGER DEFAULT 0", None),
             ]:
                 try:
                     con.execute(col_def[0])
                 except Exception:
                     pass
+            # Every closed live trade, unfiltered — meta-label training data.
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS ml_samples (
+                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticket         INTEGER UNIQUE,
+                    symbol         TEXT NOT NULL,
+                    direction      TEXT NOT NULL,
+                    entry_time     TEXT NOT NULL,
+                    exit_time      TEXT,
+                    feature_vector TEXT NOT NULL,
+                    regime         TEXT,
+                    fib_proximity  REAL,
+                    cot_z_score    REAL,
+                    econ_surprise  REAL,
+                    r_multiple     REAL,
+                    pnl_pct        REAL,
+                    outcome        TEXT
+                )
+            """)
+            con.execute("CREATE INDEX IF NOT EXISTS idx_ml_entry ON ml_samples(entry_time)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_symbol      ON memories(symbol)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_fingerprint ON memories(fingerprint)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_timestamp   ON memories(timestamp)")
