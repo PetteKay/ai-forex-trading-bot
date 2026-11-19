@@ -5,6 +5,7 @@ never hammers a feed on every 60-second tick.
 """
 
 import logging
+import threading
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from urllib.request import urlopen, Request
@@ -50,6 +51,13 @@ _RSS_FEEDS = [
 _CACHE_TTL = timedelta(minutes=5)
 _cache_ts: datetime | None = None
 _cache_headlines: list[str] = []
+# Agent desks for several symbols run on worker threads; when the cache is
+# stale only one of them fetches, the others wait and reuse the result.
+_fetch_lock = threading.Lock()
+# After every feed fails, wait this long before trying again (instead of
+# retrying all feeds — up to 6 s each — for every symbol on every tick).
+_FAIL_BACKOFF = timedelta(minutes=2)
+_fail_ts: datetime | None = None
 
 
 def fetch_headlines(symbol: str, max_headlines: int = 8) -> list[str]:
@@ -65,6 +73,18 @@ def fetch_headlines(symbol: str, max_headlines: int = 8) -> list[str]:
     if _cache_ts and (now - _cache_ts) < _CACHE_TTL:
         return _rank_for_symbol(_cache_headlines, symbol, max_headlines)
 
+    with _fetch_lock:
+        now = datetime.now(timezone.utc)
+        if _cache_ts and (now - _cache_ts) < _CACHE_TTL:   # filled while we waited
+            return _rank_for_symbol(_cache_headlines, symbol, max_headlines)
+        if _fail_ts and (now - _fail_ts) < _FAIL_BACKOFF:   # all feeds just failed
+            return _rank_for_symbol(_cache_headlines, symbol, max_headlines)
+        _refresh(now)
+    return _rank_for_symbol(_cache_headlines, symbol, max_headlines)
+
+
+def _refresh(now: datetime) -> None:
+    global _cache_ts, _cache_headlines, _fail_ts
     fresh: list[str] = []
     for url in _RSS_FEEDS:
         try:
@@ -82,10 +102,11 @@ def fetch_headlines(symbol: str, max_headlines: int = 8) -> list[str]:
         _cache_ts = now
         _cache_headlines = fresh
         log.info(f"NewsFeed: cached {len(fresh)} headlines total")
+        _fail_ts = None
     else:
-        log.warning("NewsFeed: all feeds failed — news analyst will run without live headlines")
-
-    return _rank_for_symbol(_cache_headlines, symbol, max_headlines)
+        _fail_ts = now
+        log.warning("NewsFeed: all feeds failed — news analyst will run without live headlines "
+                    f"(retrying in {int(_FAIL_BACKOFF.total_seconds() // 60)} min)")
 
 
 def _parse_rss(url: str, timeout: int = 6) -> list[str]:

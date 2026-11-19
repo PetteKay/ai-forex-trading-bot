@@ -57,6 +57,11 @@ LLM_BASE_URL = "https://integrate.api.nvidia.com/v1"
 LLM_SEED           = 42     # Fixed seed for reproducible LLM outputs (where supported)
 LLM_MAX_TOKENS     = 1000   # Max tokens in LLM response (1000 is ample for JSON; 2048 caused 6-min hangs)
 LLM_TIMEOUT_SECONDS = 30    # Hard timeout per LLM call — prevents MT5 IPC disconnect during slow responses
+# Agent desks (Technical, Bear, News, Fund Manager) for this many symbols run
+# at the same time. All MT5 calls stay on the main thread. Higher = faster ticks
+# but more simultaneous LLM requests; lower it if your provider rate-limits you.
+# 1 = one symbol at a time (the original behaviour).
+DESK_PARALLELISM   = 3
 
 # --- Per-agent model overrides (optional) ---
 # Use a stronger model for the most critical decision-makers.

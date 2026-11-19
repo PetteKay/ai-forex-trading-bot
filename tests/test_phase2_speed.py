@@ -25,3 +25,90 @@ class TestRiskManagerOnlyForCandidates(unittest.TestCase):
         self.assertEqual(r["orders"], EXPECTED_ORDERS)
         self.assertEqual(r["llm_calls"]["risk_manager"], len(EXPECTED_ORDERS),
                          "Risk Manager LLM ran for HOLDs / blocked trades")
+
+
+class TestParallelDesks(unittest.TestCase):
+    def test_parallel_desks_same_decisions_and_faster(self):
+        seq = run_one_tick(N, LAT, desk_workers=1)
+        par = run_one_tick(N, LAT, desk_workers=3)
+        for r in (seq, par):
+            self.assertIsNone(r["error"], r["error"])
+            self.assertEqual(r["orders"], EXPECTED_ORDERS)
+        self.assertEqual(seq["llm_calls"], par["llm_calls"])
+        self.assertLess(par["tick_seconds"], seq["tick_seconds"] * 0.75,
+                        f"parallel {par['tick_seconds']}s vs sequential {seq['tick_seconds']}s")
+
+    def test_mt5_only_touched_from_main_thread(self):
+        r = run_one_tick(N, LAT, desk_workers=4)
+        self.assertIsNone(r["error"], r["error"])
+        self.assertEqual(r["mt5_threads"], ["MainThread"])
+
+
+class TestNewsRunsAlongsideTechnical(unittest.TestCase):
+    def test_desk_critical_path(self):
+        """One desk: Technical+Bear (2 calls) overlaps Headlines+News (2 calls) → ~3 calls, not 5."""
+        import time, types
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from agents.desk import run_desk
+        lat = 0.2
+        slow = lambda result: (lambda *a, **k: (time.sleep(lat), result)[1])
+        agents = {
+            "technical": types.SimpleNamespace(analyse=slow({"bias": "BULLISH"})),
+            "bear": types.SimpleNamespace(analyse=slow({"risk_score": 3})),
+            "news": types.SimpleNamespace(analyse=slow({"macro_tone": "NEUTRAL"})),
+            "portfolio_manager": types.SimpleNamespace(decide=slow({"action": "HOLD"})),
+        }
+        job = {"symbol": "EURUSD", "ctx": {}, "regime_info": {}, "memories": [],
+               "extra_signals": {}, "upcoming_events": []}
+        t = time.perf_counter()
+        out = run_desk(job, types.SimpleNamespace(), agents, slow(["h"]))
+        took = time.perf_counter() - t
+        self.assertEqual(out["pm"]["action"], "HOLD")
+        self.assertEqual(out["live_headlines"], ["h"])
+        # sequential would be 5 × 0.2 = 1.0 s; overlapped critical path is 3 × 0.2 = 0.6 s
+        self.assertLess(took, 0.8, f"desk took {took:.2f}s — News not overlapping Technical")
+
+
+class TestSharedFetchesUnderParallelDesks(unittest.TestCase):
+    def _reset_news(self):
+        from data import news_feed
+        news_feed._cache_ts, news_feed._cache_headlines, news_feed._fail_ts = None, [], None
+        return news_feed
+
+    def test_headlines_fetched_once_for_many_threads(self):
+        import threading, time
+        from unittest import mock
+        nf = self._reset_news()
+        n_fetch = []
+        def slow_parse(url):
+            n_fetch.append(url); time.sleep(0.2); return ["Dollar firm"]
+        with mock.patch.object(nf, "_parse_rss", side_effect=slow_parse):
+            ts = [threading.Thread(target=nf.fetch_headlines, args=(s,)) for s in
+                  ("EURUSD", "GBPUSD", "USDJPY", "XAUUSD", "AUDUSD", "USDCAD")]
+            [t.start() for t in ts]; [t.join() for t in ts]
+        self.assertEqual(len(n_fetch), len(nf._RSS_FEEDS), "feeds were fetched more than once")
+
+    def test_failed_feeds_back_off(self):
+        from unittest import mock
+        from urllib.error import URLError
+        nf = self._reset_news()
+        with mock.patch.object(nf, "_parse_rss", side_effect=URLError("down")) as p:
+            for s in ("EURUSD", "GBPUSD", "USDJPY"):
+                self.assertEqual(nf.fetch_headlines(s), [])
+        self.assertEqual(p.call_count, len(nf._RSS_FEEDS),
+                         "every symbol retried every dead feed")
+
+    def test_macro_fetched_once_and_failure_backs_off(self):
+        import threading, time
+        from unittest import mock
+        from data import macro_context as mc
+        import data.process_isolation as pi
+        mc._cache, mc._cache_ts = {}, 0.0
+        n = []
+        def iso(fn, *a, **k):
+            n.append(1); time.sleep(0.2); return {}
+        with mock.patch.object(pi, "run_isolated", side_effect=iso):
+            ts = [threading.Thread(target=mc.get_macro_context, args=("EURUSD",)) for _ in range(5)]
+            [t.start() for t in ts]; [t.join() for t in ts]
+            mc.get_macro_context("GBPUSD")
+        self.assertEqual(len(n), 1, f"macro fetch ran {len(n)} times")

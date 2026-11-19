@@ -66,7 +66,15 @@ def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None):
     symbols = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "NZDUSD", "USDCHF",
                "EURGBP", "EURJPY", "GBPJPY", "XAUUSD", "AUDJPY"][:n_symbols]
     calls, orders, threads_seen = Counter(), [], set()
+    mt5_threads = set()          # every thread that touched MT5 (must be MainThread)
     lock = threading.Lock()
+
+    def _mt5(fn):
+        def wrapped(*a, **k):
+            with lock:
+                mt5_threads.add(threading.current_thread().name)
+            return fn(*a, **k)
+        return wrapped
 
     def _agent(name, result_fn):
         def fn(*a, **k):
@@ -84,6 +92,10 @@ def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None):
             return {"action": "BUY", "confidence": 85, "reasoning": "harness",
                     "bull_bear_verdict": "BULL"}
         return {"action": "HOLD", "confidence": 40, "reasoning": "harness"}
+
+    _raw = sys.modules["MetaTrader5"]
+    _raw.symbol_info   = _mt5(_raw.symbol_info)
+    _raw.positions_get = _mt5(_raw.positions_get)
 
     tick = {"start": None, "end": None}
 
@@ -111,20 +123,19 @@ def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None):
     patches = [mock.patch.object(config, k, v, create=True) for k, v in cfg_over.items()]
     mb = bot.mt5b
     patches += [
-        mock.patch.object(mb, "connect", return_value=True),
-        mock.patch.object(mb, "disconnect", return_value=None),
-        mock.patch.object(mb, "is_connected", return_value=True),
-        mock.patch.object(mb, "resolve_symbol", side_effect=lambda s: s),
-        mock.patch.object(mb, "get_account_equity", return_value=10_000.0),
-        mock.patch.object(mb, "get_account_balance", return_value=10_000.0),
-        mock.patch.object(mb, "get_all_open_positions", return_value=[]),
-        mock.patch.object(mb, "get_candles",
-                          side_effect=lambda s, tf, count=200, **k: _bars(count, "h" if tf != "H4" else "4h",
-                                                                          abs(hash(s)) % 1000)),
-        mock.patch.object(mb, "get_live_price", return_value=None),
-        mock.patch.object(mb, "get_spread_pips", return_value=1.0),
-        mock.patch.object(mb, "get_risk_usd", return_value=10.0),
-        mock.patch.object(mb, "place_order", side_effect=_place_order),
+        mock.patch.object(mb, "connect", side_effect=_mt5(lambda: True)),
+        mock.patch.object(mb, "disconnect", side_effect=_mt5(lambda: None)),
+        mock.patch.object(mb, "is_connected", side_effect=_mt5(lambda: True)),
+        mock.patch.object(mb, "resolve_symbol", side_effect=_mt5(lambda s: s)),
+        mock.patch.object(mb, "get_account_equity", side_effect=_mt5(lambda: 10_000.0)),
+        mock.patch.object(mb, "get_account_balance", side_effect=_mt5(lambda: 10_000.0)),
+        mock.patch.object(mb, "get_all_open_positions", side_effect=_mt5(lambda *a: [])),
+        mock.patch.object(mb, "get_candles", side_effect=_mt5(
+            lambda s, tf, count=200, **k: _bars(count, "h" if tf != "H4" else "4h", abs(hash(s)) % 1000))),
+        mock.patch.object(mb, "get_live_price", side_effect=_mt5(lambda s: None)),
+        mock.patch.object(mb, "get_spread_pips", side_effect=_mt5(lambda s: 1.0)),
+        mock.patch.object(mb, "get_risk_usd", side_effect=_mt5(lambda *a, **k: 10.0)),
+        mock.patch.object(mb, "place_order", side_effect=_mt5(_place_order)),
         mock.patch.object(bot.llm, "init", return_value=None),
         mock.patch.object(bot, "_sleep", side_effect=_sleep),
         mock.patch.object(bot, "fetch_headlines", side_effect=_agent("headlines", lambda *a, **k: ["Dollar firm"])),
@@ -162,7 +173,8 @@ def run_one_tick(n_symbols=6, latency=0.3, buy_every=3, desk_workers=None):
         os.chdir(old_cwd)
     end = tick["end"] or time.perf_counter()
     return {"tick_seconds": round(end - tick["start"], 2), "llm_calls": dict(calls),
-            "orders": orders, "threads_seen": len(threads_seen), "error": err}
+            "orders": orders, "threads_seen": len(threads_seen),
+            "mt5_threads": sorted(mt5_threads), "error": err}
 
 
 if __name__ == "__main__":

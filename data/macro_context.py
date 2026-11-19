@@ -19,6 +19,7 @@ Requires: yfinance  (py -m pip install yfinance)
 
 import json
 import logging
+import threading
 import time
 from datetime import datetime, timezone
 from urllib.request import urlopen, Request
@@ -28,6 +29,10 @@ log = logging.getLogger("MacroContext")
 
 _cache: dict = {}
 _cache_ts: float = 0.0
+_fetch_lock = threading.Lock()
+# After a failed fetch (empty result), wait this long before trying again
+# instead of spawning a new 25 s fetch for every symbol.
+_FAIL_BACKOFF_SECONDS = 120
 _CACHE_TTL = 900  # 15 minutes — yfinance 1h bars; no need to refresh every 5 min
 
 
@@ -145,6 +150,13 @@ def _fetch_all(symbol: str) -> dict:
     return ctx
 
 
+def _fresh(now: float) -> bool:
+    if not _cache_ts:
+        return False
+    ttl = _CACHE_TTL if _cache else _FAIL_BACKOFF_SECONDS
+    return (now - _cache_ts) < ttl
+
+
 def get_macro_context(symbol: str = "EURUSD") -> dict:
     """
     Return a dict of live macro signals relevant to the given symbol.
@@ -161,14 +173,17 @@ def get_macro_context(symbol: str = "EURUSD") -> dict:
     """
     global _cache, _cache_ts
     now = time.time()
-    if _cache and (now - _cache_ts) < _CACHE_TTL:
+    if _fresh(now):
         return _cache
 
-    from data.process_isolation import run_isolated
-    ctx = run_isolated(_fetch_all, symbol, timeout=25.0, default={})
-
-    _cache    = ctx
-    _cache_ts = time.time()
+    # Agent desks run on several threads; only one spawns the fetch process.
+    with _fetch_lock:
+        if _fresh(time.time()):   # filled while we waited
+            return _cache
+        from data.process_isolation import run_isolated
+        ctx = run_isolated(_fetch_all, symbol, timeout=25.0, default={})
+        _cache    = ctx
+        _cache_ts = time.time()
 
     if ctx:
         log.info(
